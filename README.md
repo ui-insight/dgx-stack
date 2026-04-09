@@ -1,15 +1,21 @@
 # DGX Stack
 
-Two-container stack for running **Gemma 4 26B** multimodal on an **NVIDIA DGX Spark** (ARM Grace CPU + Blackwell GPU, 128GB unified memory).
+Two-container stack for running a multimodal LLM on an **NVIDIA DGX Spark** (ARM Grace CPU + Blackwell GPU, 128GB unified memory). One container serves the model via vLLM, the other provides document OCR using the same model's vision capabilities.
 
-- **vLLM container** — serves Gemma 4 26B via an OpenAI-compatible API with FP8 KV cache and 128K context
-- **OCR container** — converts PDFs, images, and Office documents to markdown using the vision model
+## Supported Models
+
+| Model | Total Params | Active | Weights (BF16) | Context | Notes |
+|-------|-------------|--------|-----------------|---------|-------|
+| **Gemma 4 26B** | 26B MoE | 4B | ~52GB | 128K | Stronger general LLM. Requires HF token + license. |
+| **Qwen 3.5 35B** | 35B MoE | 3B | ~70GB | 262K | Excellent OCR/tables. Open access, no token needed. |
+
+Both models are multimodal (vision) and serve as both the LLM and OCR backend.
 
 ## Prerequisites
 
 - NVIDIA DGX Spark (or any Grace-Blackwell system with CUDA 13)
 - Docker Engine with [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/)
-- A [HuggingFace token](https://huggingface.co/settings/tokens) with access to [google/gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it)
+- For Gemma 4: a [HuggingFace token](https://huggingface.co/settings/tokens) with access to [google/gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it)
 
 ## Quick Start
 
@@ -19,15 +25,13 @@ cd dgx-stack
 ./setup.sh
 ```
 
-The setup script walks you through configuration (ports, memory limits, HuggingFace token) and optionally deploys immediately.
+The setup script asks you to choose a model, then walks through configuration (ports, memory limits, HuggingFace token) and optionally deploys immediately.
 
 ## Manual Setup
 
-If you prefer to configure manually:
-
 ```bash
 cp .env.example .env
-# Edit .env with your settings
+# Edit .env — uncomment the model you want
 docker compose up -d
 ```
 
@@ -37,14 +41,15 @@ docker compose up -d
 ┌─────────────────────────────────────────────────────────┐
 │  DGX Spark (128GB unified memory)                       │
 │                                                         │
-│  ┌──────────────────┐      ┌────────────────────-──┐    │
-│  │  vLLM            │      │  OCR Service          │    │
-│  │  :8000           │◄─────│  :8001                │    │
-│  │                  │      │                       │    │
-│  │  gemma-4-26b     │      │  /v1/ocr   (JSON)     │    │
-│  │  BF16 + FP8 KV   │      │  /v1/ocrmd (markdown) │    │
-│  │  128K context    │      │                       │    │
-│  └──────────────────┘      └─────────────────────-─┘    │
+│  ┌──────────────────┐      ┌───────────────────────┐    │
+│  │  vLLM            │      │  OCR Service           │    │
+│  │  :8000           │◄─────│  :8001                 │    │
+│  │                  │      │                        │    │
+│  │  gemma-4-26b     │      │  /v1/ocr   (JSON)      │    │
+│  │    — or —        │      │  /v1/ocrmd (markdown)  │    │
+│  │  qwen3.5-35b     │      │                        │    │
+│  │  FP8 KV cache    │      │                        │    │
+│  └──────────────────┘      └───────────────────────┘    │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -52,7 +57,7 @@ docker compose up -d
 
 1. **Convert** — PDF pages (via poppler), images, or Office docs (via LibreOffice) are converted to PNG images
 2. **Chunk** — Pages are grouped into overlapping windows (default: 6 pages/chunk, 2-page overlap)
-3. **Infer** — Each chunk is sent to Gemma 4's vision capabilities for markdown extraction (parallel, up to 4 concurrent)
+3. **Infer** — Each chunk is sent to the model's vision capabilities for markdown extraction (parallel, up to 4 concurrent)
 4. **Retry** — Chunks with suspiciously short output are automatically retried with a stronger prompt
 5. **Merge** — Overlapping chunk outputs are stitched together using `difflib` sequence matching to eliminate duplicated content
 
@@ -71,6 +76,8 @@ curl http://localhost:8000/v1/chat/completions \
     "max_tokens": 256
   }'
 ```
+
+Replace `gemma-4-26b` with `qwen3.5-35b` if using Qwen.
 
 ### OCR — JSON response (port 8001)
 
@@ -114,13 +121,13 @@ curl -X POST http://localhost:8001/v1/ocrmd -F file=@document.pdf
 
 ### OCR Parameters
 
-| Parameter    | Type |  Default    | Description                          |
-|--------------|------|-------------|--------------------------------------|
-| `file`       | file | required    | PDF, image, or Office document       |
-| `model`      | str  | gemma-4-26b | Override the vision model            |
-| `chunk_size` | int  | 6           | Pages per chunk                      |
-| `overlap`    | int  | 2           | Overlapping pages between chunks     |
-| `dpi`        | int  | 200         | PDF/Office rendering resolution      |
+| Parameter    | Type | Default | Description                     |
+|-------------|------|---------|---------------------------------|
+| `file`       | file | required | PDF, image, or Office document |
+| `model`      | str  | from env | Override the vision model      |
+| `chunk_size` | int  | 6       | Pages per chunk                 |
+| `overlap`    | int  | 2       | Overlapping pages between chunks |
+| `dpi`        | int  | 200     | PDF/Office rendering resolution |
 
 ### Supported File Types
 
@@ -134,11 +141,14 @@ All settings live in `.env` (generated by `setup.sh`). Key options:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HF_TOKEN` | — | HuggingFace API token (required) |
+| `VLLM_IMAGE` | varies by model | Docker image for vLLM |
+| `HF_MODEL_ID` | varies by model | HuggingFace model path |
+| `SERVED_MODEL_NAME` | varies by model | Name exposed in the API |
+| `HF_TOKEN` | — | HuggingFace API token (required for Gemma 4) |
 | `VLLM_PORT` | 8000 | vLLM API port |
 | `OCR_PORT` | 8001 | OCR service port |
 | `GPU_MEMORY_UTIL` | 0.75 | Fraction of 128GB unified memory for vLLM (~96GB) |
-| `MAX_MODEL_LEN` | 131072 | Max context length in tokens (up to 256K) |
+| `MAX_MODEL_LEN` | 131072 | Max context length in tokens |
 | `MAX_NUM_SEQS` | 4 | Max concurrent inference sequences |
 | `KV_CACHE_DTYPE` | fp8 | KV cache precision — `fp8` or `auto` (BF16 fallback) |
 | `HF_CACHE` | ~/.cache/huggingface | Model weight cache directory |
@@ -149,6 +159,21 @@ All settings live in `.env` (generated by `setup.sh`). Key options:
 | `OCR_MAX_CONCURRENT_CHUNKS` | 4 | Parallel chunk processing limit |
 | `OCR_MAX_PAGES` | 200 | Max pages per document |
 | `OCR_MAX_FILE_SIZE_MB` | 100 | Max upload size |
+
+## Switching Models
+
+Re-run setup to switch:
+
+```bash
+./setup.sh
+```
+
+Or edit `.env` directly — swap the `VLLM_IMAGE`, `HF_MODEL_ID`, `SERVED_MODEL_NAME`, and `VLLM_EXTRA_FLAGS` lines, then:
+
+```bash
+docker compose down
+docker compose up -d
+```
 
 ## Operations
 
@@ -169,9 +194,6 @@ git pull
 docker compose build ocr
 docker compose pull vllm
 docker compose up -d
-
-# Reconfigure
-./setup.sh
 ```
 
 ## Important Notes
@@ -179,6 +201,7 @@ docker compose up -d
 - **No FP8 weight quantization** — Dynamic FP8 (`--quantization fp8`) produces gibberish on Gemma 4 (vllm-project/vllm#39049). This stack uses BF16 weights with FP8 KV cache, which works correctly.
 - **FP8 KV cache issues** — If you see CUDA stream capture errors or FlashInfer kernel crashes, switch to BF16 KV cache by setting `KV_CACHE_DTYPE=auto` in `.env` and restarting. This uses more memory but avoids FlashInfer FP8 kernel issues on SM12.1.
 - **GPU memory** — The DGX Spark uses unified memory. Setting `GPU_MEMORY_UTIL` too high (>0.85) can starve the OS and OCR container. Default 0.75 leaves ~32GB headroom.
-- **First startup is slow** — The model (~52GB) must be downloaded on first run. Subsequent starts use the cached weights.
-- **Model access** — You must accept the Gemma 4 license on HuggingFace before the download will work.
-- **Gemma 4 on vLLM is new** — Support landed recently. If you hit issues, check [vllm-project/vllm](https://github.com/vllm-project/vllm/issues) for Gemma 4-specific bug reports.
+- **Qwen 3.5 memory** — At BF16 (~70GB weights), Qwen 3.5 35B is a tighter fit than Gemma 4 (~52GB). If you hit OOM, reduce `MAX_MODEL_LEN` or set `KV_CACHE_DTYPE=fp8`.
+- **First startup is slow** — The model must be downloaded on first run (~52GB for Gemma 4, ~70GB for Qwen 3.5). Subsequent starts use the cached weights.
+- **Gemma 4 access** — You must accept the Gemma 4 license on HuggingFace before the download will work.
+- **Qwen 3.5 warmup** — The first request after startup takes ~60s due to torch.compile/CUDA graph warmup. Subsequent requests are fast.

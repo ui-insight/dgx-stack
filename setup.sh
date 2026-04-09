@@ -18,7 +18,7 @@ banner() {
     echo ""
     echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════╗${RESET}"
     echo -e "${CYAN}${BOLD}║           DGX Spark Stack Setup                         ║${RESET}"
-    echo -e "${CYAN}${BOLD}║           vLLM (Gemma 4 26B) + OCR Service              ║${RESET}"
+    echo -e "${CYAN}${BOLD}║           vLLM + OCR Service                            ║${RESET}"
     echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════════════╝${RESET}"
     echo ""
 }
@@ -78,39 +78,123 @@ preflight() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Model selection
+# ───────────────────────────────────────────────────────────────────────────
+
+select_model() {
+    echo -e "${BOLD}── Model Selection ──${RESET}"
+    echo ""
+    echo "  Both models serve as LLM and OCR (multimodal vision)."
+    echo ""
+    echo -e "  ${BOLD}1)${RESET} Gemma 4 26B  ${DIM}(google/gemma-4-26B-A4B-it)${RESET}"
+    echo "     MoE 26B total / 4B active, BF16 ~52GB weights"
+    echo "     128K context, strong general LLM"
+    echo "     Requires HuggingFace token + license acceptance"
+    echo ""
+    echo -e "  ${BOLD}2)${RESET} Qwen 3.5 35B ${DIM}(Qwen/Qwen3.5-35B-A3B)${RESET}"
+    echo "     MoE 35B total / 3B active, BF16 ~70GB weights"
+    echo "     262K context, excellent OCR and table handling"
+    echo "     Open access, no token required"
+    echo ""
+
+    local choice
+    ask "Select model (1 or 2)" "1" choice
+
+    case "$choice" in
+        1)
+            MODEL_CHOICE="gemma4"
+            VLLM_IMAGE="vllm/vllm-openai:gemma4-cu130"
+            HF_MODEL_ID="google/gemma-4-26B-A4B-it"
+            SERVED_MODEL_NAME="gemma-4-26b"
+            DEFAULT_MAX_MODEL_LEN="131072"
+            DEFAULT_GPU_MEMORY_UTIL="0.75"
+            DEFAULT_KV_CACHE_DTYPE="fp8"
+            VLLM_EXTRA_FLAGS=""
+            NEEDS_HF_TOKEN=true
+            info "Selected: Gemma 4 26B"
+            ;;
+        2)
+            MODEL_CHOICE="qwen35"
+            VLLM_IMAGE="vllm/vllm-openai:cu130-nightly"
+            HF_MODEL_ID="Qwen/Qwen3.5-35B-A3B"
+            SERVED_MODEL_NAME="qwen3.5-35b"
+            DEFAULT_MAX_MODEL_LEN="131072"
+            DEFAULT_GPU_MEMORY_UTIL="0.75"
+            DEFAULT_KV_CACHE_DTYPE="fp8"
+            VLLM_EXTRA_FLAGS="--enable-prefix-caching --reasoning-parser qwen3"
+            NEEDS_HF_TOKEN=false
+            info "Selected: Qwen 3.5 35B"
+            echo ""
+            warn "Qwen 3.5 35B at BF16 uses ~70GB. With FP8 KV cache and"
+            warn "0.75 memory utilization (~96GB), this is a tight fit."
+            warn "If you hit OOM, try reducing max context length."
+            ;;
+        *)
+            error "Invalid choice. Please enter 1 or 2."
+            exit 1
+            ;;
+    esac
+    echo ""
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Configuration prompts
 # ───────────────────────────────────────────────────────────────────────────
 
 configure() {
-    echo -e "${BOLD}── HuggingFace Token ──${RESET}"
-    echo "Gemma 4 is a gated model. You need a HuggingFace token with access."
-    echo "Get one at: https://huggingface.co/settings/tokens"
-    echo "Accept the license at: https://huggingface.co/google/gemma-4-26B-A4B-it"
-    echo ""
+    # ── HuggingFace Token ──
+    if [[ "$NEEDS_HF_TOKEN" == true ]]; then
+        echo -e "${BOLD}── HuggingFace Token ──${RESET}"
+        echo "Gemma 4 is a gated model. You need a HuggingFace token with access."
+        echo "Get one at: https://huggingface.co/settings/tokens"
+        echo "Accept the license at: https://huggingface.co/google/gemma-4-26B-A4B-it"
+        echo ""
 
-    # Check for existing token
-    local hf_default=""
-    if [[ -n "${HF_TOKEN:-}" ]]; then
-        hf_default="$HF_TOKEN"
-        info "Found HF_TOKEN in environment."
-    elif [[ -f "$HOME/.cache/huggingface/token" ]]; then
-        hf_default=$(cat "$HOME/.cache/huggingface/token")
-        info "Found cached HuggingFace token."
-    fi
+        local hf_default=""
+        if [[ -n "${HF_TOKEN:-}" ]]; then
+            hf_default="$HF_TOKEN"
+            info "Found HF_TOKEN in environment."
+        elif [[ -f "$HOME/.cache/huggingface/token" ]]; then
+            hf_default=$(cat "$HOME/.cache/huggingface/token")
+            info "Found cached HuggingFace token."
+        fi
 
-    if [[ -n "$hf_default" ]]; then
-        local masked="${hf_default:0:8}...${hf_default: -4}"
-        echo -ne "${BOLD}HuggingFace token${RESET} ${DIM}[${masked}]${RESET}: "
-        read -r input
-        HF_TOKEN="${input:-$hf_default}"
+        if [[ -n "$hf_default" ]]; then
+            local masked="${hf_default:0:8}...${hf_default: -4}"
+            echo -ne "${BOLD}HuggingFace token${RESET} ${DIM}[${masked}]${RESET}: "
+            read -r input
+            HF_TOKEN="${input:-$hf_default}"
+        else
+            echo -ne "${BOLD}HuggingFace token${RESET}: "
+            read -r HF_TOKEN
+        fi
+
+        if [[ -z "$HF_TOKEN" ]]; then
+            error "HuggingFace token is required for Gemma 4."
+            exit 1
+        fi
     else
-        echo -ne "${BOLD}HuggingFace token${RESET}: "
-        read -r HF_TOKEN
-    fi
+        echo -e "${BOLD}── HuggingFace Token ──${RESET}"
+        echo "Qwen 3.5 is open access. A token is optional but recommended"
+        echo "for faster downloads from HuggingFace."
+        echo ""
 
-    if [[ -z "$HF_TOKEN" ]]; then
-        error "HuggingFace token is required."
-        exit 1
+        local hf_default=""
+        if [[ -n "${HF_TOKEN:-}" ]]; then
+            hf_default="$HF_TOKEN"
+        elif [[ -f "$HOME/.cache/huggingface/token" ]]; then
+            hf_default=$(cat "$HOME/.cache/huggingface/token")
+        fi
+
+        if [[ -n "$hf_default" ]]; then
+            local masked="${hf_default:0:8}...${hf_default: -4}"
+            echo -ne "${BOLD}HuggingFace token (optional)${RESET} ${DIM}[${masked}]${RESET}: "
+            read -r input
+            HF_TOKEN="${input:-$hf_default}"
+        else
+            echo -ne "${BOLD}HuggingFace token (optional, press Enter to skip)${RESET}: "
+            read -r HF_TOKEN
+        fi
     fi
     echo ""
 
@@ -123,12 +207,17 @@ configure() {
     # ── GPU / Memory ──
     echo -e "${BOLD}── GPU Memory ──${RESET}"
     echo "DGX Spark has 128GB unified memory shared between CPU and GPU."
-    echo "0.75 = ~96GB for the model, leaving ~32GB for OS + OCR processing."
+    if [[ "$MODEL_CHOICE" == "qwen35" ]]; then
+        echo "Qwen 3.5 35B BF16 weights are ~70GB. At 0.75 (~96GB), ~26GB"
+        echo "remains for KV cache + OS + OCR container."
+    else
+        echo "Gemma 4 26B BF16 weights are ~52GB. At 0.75 (~96GB), ~44GB"
+        echo "remains for KV cache + OS + OCR container."
+    fi
     echo ""
-    ask "GPU memory utilization (0.5 - 0.90)" "0.75" GPU_MEMORY_UTIL
+    ask "GPU memory utilization (0.5 - 0.90)" "$DEFAULT_GPU_MEMORY_UTIL" GPU_MEMORY_UTIL
     echo ""
 
-    # Validate range
     if (( $(echo "$GPU_MEMORY_UTIL < 0.5" | bc -l 2>/dev/null || echo 0) )) || \
        (( $(echo "$GPU_MEMORY_UTIL > 0.95" | bc -l 2>/dev/null || echo 0) )); then
         warn "Unusual value: $GPU_MEMORY_UTIL. Recommended range is 0.60 - 0.85."
@@ -142,19 +231,25 @@ configure() {
 
     # ── Model Config ──
     echo -e "${BOLD}── Model Configuration ──${RESET}"
-    ask "Max context length (tokens)" "131072" MAX_MODEL_LEN
+    ask "Max context length (tokens)" "$DEFAULT_MAX_MODEL_LEN" MAX_MODEL_LEN
     ask "Max concurrent sequences" "4" MAX_NUM_SEQS
     echo ""
+
+    # ── KV Cache ──
     echo -e "${BOLD}── KV Cache ──${RESET}"
     echo "FP8 KV cache saves memory but may cause FlashInfer errors on some builds."
     echo "Use 'auto' (BF16) as a fallback if you see CUDA stream capture errors."
     echo ""
-    ask "KV cache dtype (fp8 or auto)" "fp8" KV_CACHE_DTYPE
+    ask "KV cache dtype (fp8 or auto)" "$DEFAULT_KV_CACHE_DTYPE" KV_CACHE_DTYPE
     echo ""
 
     # ── HuggingFace Cache ──
     echo -e "${BOLD}── Storage ──${RESET}"
-    echo "Model weights (~52GB) are cached locally to avoid re-downloading."
+    if [[ "$MODEL_CHOICE" == "qwen35" ]]; then
+        echo "Model weights (~70GB) are cached locally to avoid re-downloading."
+    else
+        echo "Model weights (~52GB) are cached locally to avoid re-downloading."
+    fi
     ask "HuggingFace cache directory" "$HOME/.cache/huggingface" HF_CACHE
     echo ""
 
@@ -194,7 +289,14 @@ write_env() {
 # ─────────────────────────────────────────────
 # DGX Stack Configuration
 # Generated by setup.sh on $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+# Model: ${MODEL_CHOICE}
 # ─────────────────────────────────────────────
+
+# Model
+VLLM_IMAGE=${VLLM_IMAGE}
+HF_MODEL_ID=${HF_MODEL_ID}
+SERVED_MODEL_NAME=${SERVED_MODEL_NAME}
+VLLM_EXTRA_FLAGS=${VLLM_EXTRA_FLAGS:---no-enable-prefix-caching}
 
 # HuggingFace
 HF_TOKEN=${HF_TOKEN}
@@ -232,6 +334,8 @@ review() {
     echo ""
     echo -e "${BOLD}── Configuration Summary ──${RESET}"
     echo ""
+    printf "  %-30s %s\n" "Model:" "${SERVED_MODEL_NAME} (${HF_MODEL_ID})"
+    printf "  %-30s %s\n" "Container:" "${VLLM_IMAGE}"
     printf "  %-30s %s\n" "vLLM port:" "$VLLM_PORT"
     printf "  %-30s %s\n" "OCR port:" "$OCR_PORT"
     printf "  %-30s %s\n" "GPU memory utilization:" "$GPU_MEMORY_UTIL ($(echo "$GPU_MEMORY_UTIL * 128" | bc)GB of 128GB)"
@@ -242,6 +346,9 @@ review() {
     printf "  %-30s %s\n" "OCR chunk/overlap:" "${OCR_CHUNK_SIZE} pages / ${OCR_OVERLAP} overlap"
     printf "  %-30s %s\n" "OCR DPI:" "$OCR_DPI"
     printf "  %-30s %s\n" "OCR max tokens:" "$OCR_MAX_TOKENS"
+    if [[ -n "$VLLM_EXTRA_FLAGS" ]]; then
+        printf "  %-30s %s\n" "Extra vLLM flags:" "$VLLM_EXTRA_FLAGS"
+    fi
     echo ""
 }
 
@@ -276,13 +383,16 @@ deploy() {
 
     echo ""
     info "Waiting for vLLM to load the model..."
-    info "This takes several minutes. The model is ~52GB."
+    if [[ "$MODEL_CHOICE" == "qwen35" ]]; then
+        info "Qwen 3.5 35B is ~70GB. First request may take ~60s to warm up."
+    else
+        info "Gemma 4 26B is ~52GB. This takes several minutes."
+    fi
     echo ""
     echo -e "${DIM}  Watch progress:  docker compose logs -f vllm${RESET}"
     echo -e "${DIM}  Check health:    curl http://localhost:${VLLM_PORT}/health${RESET}"
     echo ""
 
-    # Wait for health with a progress indicator
     local max_wait=600
     local elapsed=0
     local interval=10
@@ -311,6 +421,8 @@ deploy() {
     echo -e "${GREEN}${BOLD}║  Stack is running!                                      ║${RESET}"
     echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════════════════════╝${RESET}"
     echo ""
+    echo "  Model: ${SERVED_MODEL_NAME}"
+    echo ""
     echo "  LLM API (OpenAI-compatible):"
     echo "    http://localhost:${VLLM_PORT}/v1/chat/completions"
     echo ""
@@ -330,6 +442,7 @@ deploy() {
 main() {
     banner
     preflight
+    select_model
     configure
     review
     write_env

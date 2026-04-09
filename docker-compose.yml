@@ -1,7 +1,7 @@
 services:
   vllm:
-    image: vllm/vllm-openai:gemma4-cu130
-    container_name: vllm-gemma4
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:gemma4-cu130}
+    container_name: vllm-server
     deploy:
       resources:
         reservations:
@@ -16,26 +16,18 @@ services:
     environment:
       - VLLM_FLASHINFER_MOE_BACKEND=latency
       - HF_TOKEN=${HF_TOKEN}
+      - HF_MODEL_ID=${HF_MODEL_ID:-google/gemma-4-26B-A4B-it}
+      - SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-gemma-4-26b}
+      - VLLM_PORT=${VLLM_PORT:-8000}
+      - KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-fp8}
+      - MAX_MODEL_LEN=${MAX_MODEL_LEN:-131072}
+      - GPU_MEMORY_UTIL=${GPU_MEMORY_UTIL:-0.75}
+      - MAX_NUM_SEQS=${MAX_NUM_SEQS:-4}
+      - VLLM_EXTRA_FLAGS=${VLLM_EXTRA_FLAGS:---no-enable-prefix-caching}
     volumes:
       - ${HF_CACHE:-~/.cache/huggingface}:/root/.cache/huggingface
-    command:
-      - --model
-      - google/gemma-4-26B-A4B-it
-      - --served-model-name
-      - gemma-4-26b
-      - --host
-      - "0.0.0.0"
-      - --port
-      - "${VLLM_PORT:-8000}"
-      - --kv-cache-dtype
-      - "${KV_CACHE_DTYPE:-fp8}"
-      - --max-model-len
-      - "${MAX_MODEL_LEN:-131072}"
-      - --gpu-memory-utilization
-      - "${GPU_MEMORY_UTIL:-0.75}"
-      - --max-num-seqs
-      - "${MAX_NUM_SEQS:-4}"
-      - --trust-remote-code
+      - ./vllm-entrypoint.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:${VLLM_PORT:-8000}/health"]
       interval: 30s
@@ -53,7 +45,7 @@ services:
       - "${OCR_PORT:-8001}:${OCR_PORT:-8001}"
     environment:
       - VLLM_BASE_URL=http://vllm:${VLLM_PORT:-8000}
-      - VLLM_MODEL=gemma-4-26b
+      - VLLM_MODEL=${SERVED_MODEL_NAME:-gemma-4-26b}
       - OCR_PORT=${OCR_PORT:-8001}
       - OCR_CHUNK_SIZE=${OCR_CHUNK_SIZE:-6}
       - OCR_OVERLAP=${OCR_OVERLAP:-2}
