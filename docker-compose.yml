@@ -1,0 +1,71 @@
+services:
+  vllm:
+    image: vllm/vllm-openai:gemma4-cu130
+    container_name: vllm-gemma4
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host
+    shm_size: "64gb"
+    ports:
+      - "8000:8000"
+    environment:
+      - VLLM_FLASHINFER_MOE_BACKEND=latency
+      - HF_TOKEN=${HF_TOKEN}
+    volumes:
+      - ${HF_CACHE:-~/.cache/huggingface}:/root/.cache/huggingface
+    command:
+      - --model
+      - google/gemma-4-26B-A4B-it
+      - --served-model-name
+      - gemma-4-26b
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --kv-cache-dtype
+      - fp8
+      - --max-model-len
+      - "131072"
+      - --gpu-memory-utilization
+      - "0.85"
+      - --max-num-seqs
+      - "4"
+      - --trust-remote-code
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 300s
+    restart: unless-stopped
+
+  ocr:
+    build:
+      context: ./ocr
+      dockerfile: Dockerfile
+    container_name: ocr-service
+    ports:
+      - "8001:8001"
+    environment:
+      - VLLM_BASE_URL=http://vllm:8000
+      - VLLM_MODEL=gemma-4-26b
+      - OCR_PORT=8001
+      - OCR_CHUNK_SIZE=6
+      - OCR_OVERLAP=2
+      - OCR_DPI=200
+      - OCR_MAX_TOKENS=16384
+      - OCR_TEMPERATURE=0.1
+      - OCR_MAX_CONCURRENT_CHUNKS=4
+      - OCR_MIN_CHARS_PER_PAGE=400
+      - OCR_MAX_RETRIES=2
+      - OCR_MAX_PAGES=200
+      - OCR_MAX_FILE_SIZE_MB=100
+    depends_on:
+      vllm:
+        condition: service_healthy
+    restart: unless-stopped
