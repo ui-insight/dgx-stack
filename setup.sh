@@ -145,6 +145,12 @@ configure() {
     ask "Max context length (tokens)" "131072" MAX_MODEL_LEN
     ask "Max concurrent sequences" "4" MAX_NUM_SEQS
     echo ""
+    echo -e "${BOLD}── KV Cache ──${RESET}"
+    echo "FP8 KV cache saves memory but may cause FlashInfer errors on some builds."
+    echo "Use 'auto' (BF16) as a fallback if you see CUDA stream capture errors."
+    echo ""
+    ask "KV cache dtype (fp8 or auto)" "fp8" KV_CACHE_DTYPE
+    echo ""
 
     # ── HuggingFace Cache ──
     echo -e "${BOLD}── Storage ──${RESET}"
@@ -202,6 +208,7 @@ OCR_PORT=${OCR_PORT}
 GPU_MEMORY_UTIL=${GPU_MEMORY_UTIL}
 MAX_MODEL_LEN=${MAX_MODEL_LEN}
 MAX_NUM_SEQS=${MAX_NUM_SEQS}
+KV_CACHE_DTYPE=${KV_CACHE_DTYPE}
 
 # OCR
 OCR_CHUNK_SIZE=${OCR_CHUNK_SIZE}
@@ -230,6 +237,7 @@ review() {
     printf "  %-30s %s\n" "GPU memory utilization:" "$GPU_MEMORY_UTIL ($(echo "$GPU_MEMORY_UTIL * 128" | bc)GB of 128GB)"
     printf "  %-30s %s\n" "Max context length:" "$MAX_MODEL_LEN tokens"
     printf "  %-30s %s\n" "Max concurrent sequences:" "$MAX_NUM_SEQS"
+    printf "  %-30s %s\n" "KV cache dtype:" "$KV_CACHE_DTYPE"
     printf "  %-30s %s\n" "HF cache:" "$HF_CACHE"
     printf "  %-30s %s\n" "OCR chunk/overlap:" "${OCR_CHUNK_SIZE} pages / ${OCR_OVERLAP} overlap"
     printf "  %-30s %s\n" "OCR DPI:" "$OCR_DPI"

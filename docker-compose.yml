@@ -28,7 +28,7 @@ services:
       - --port
       - "${VLLM_PORT:-8000}"
       - --kv-cache-dtype
-      - fp8
+      - "${KV_CACHE_DTYPE:-fp8}"
       - --max-model-len
       - "${MAX_MODEL_LEN:-131072}"
       - --gpu-memory-utilization
