@@ -91,8 +91,8 @@ select_model() {
     echo "     128K context, strong general LLM"
     echo "     Requires HuggingFace token + license acceptance"
     echo ""
-    echo -e "  ${BOLD}2)${RESET} Qwen 3.5 35B ${DIM}(Qwen/Qwen3.5-35B-A3B)${RESET}"
-    echo "     MoE 35B total / 3B active, BF16 ~70GB weights"
+    echo -e "  ${BOLD}2)${RESET} Qwen 3.5 35B FP8 ${DIM}(Qwen/Qwen3.5-35B-A3B-FP8)${RESET}"
+    echo "     MoE 35B total / 3B active, FP8 ~35GB weights"
     echo "     262K context, excellent OCR and table handling"
     echo "     Open access, no token required"
     echo ""
@@ -110,24 +110,25 @@ select_model() {
             DEFAULT_GPU_MEMORY_UTIL="0.75"
             DEFAULT_KV_CACHE_DTYPE="fp8"
             VLLM_EXTRA_FLAGS=""
+            VLLM_TEST_FORCE_FP8_MARLIN=0
+            VLLM_USE_DEEP_GEMM=1
             NEEDS_HF_TOKEN=true
             info "Selected: Gemma 4 26B"
             ;;
         2)
             MODEL_CHOICE="qwen35"
             VLLM_IMAGE="vllm/vllm-openai:cu130-nightly"
-            HF_MODEL_ID="Qwen/Qwen3.5-35B-A3B"
+            HF_MODEL_ID="Qwen/Qwen3.5-35B-A3B-FP8"
             SERVED_MODEL_NAME="qwen3.5-35b"
             DEFAULT_MAX_MODEL_LEN="131072"
             DEFAULT_GPU_MEMORY_UTIL="0.75"
             DEFAULT_KV_CACHE_DTYPE="fp8"
             VLLM_EXTRA_FLAGS="--enable-prefix-caching --reasoning-parser qwen3"
+            VLLM_TEST_FORCE_FP8_MARLIN=1
+            VLLM_USE_DEEP_GEMM=0
             NEEDS_HF_TOKEN=false
-            info "Selected: Qwen 3.5 35B"
-            echo ""
-            warn "Qwen 3.5 35B at BF16 uses ~70GB. With FP8 KV cache and"
-            warn "0.75 memory utilization (~96GB), this is a tight fit."
-            warn "If you hit OOM, try reducing max context length."
+            info "Selected: Qwen 3.5 35B (FP8 pre-quantized)"
+            info "FP8 weights ~35GB — leaves ~61GB for KV cache at 0.75 util."
             ;;
         *)
             error "Invalid choice. Please enter 1 or 2."
@@ -208,7 +209,7 @@ configure() {
     echo -e "${BOLD}── GPU Memory ──${RESET}"
     echo "DGX Spark has 128GB unified memory shared between CPU and GPU."
     if [[ "$MODEL_CHOICE" == "qwen35" ]]; then
-        echo "Qwen 3.5 35B BF16 weights are ~70GB. At 0.75 (~96GB), ~26GB"
+        echo "Qwen 3.5 35B FP8 weights are ~35GB. At 0.75 (~96GB), ~61GB"
         echo "remains for KV cache + OS + OCR container."
     else
         echo "Gemma 4 26B BF16 weights are ~52GB. At 0.75 (~96GB), ~44GB"
@@ -246,7 +247,7 @@ configure() {
     # ── HuggingFace Cache ──
     echo -e "${BOLD}── Storage ──${RESET}"
     if [[ "$MODEL_CHOICE" == "qwen35" ]]; then
-        echo "Model weights (~70GB) are cached locally to avoid re-downloading."
+        echo "Model weights (~35GB FP8) are cached locally to avoid re-downloading."
     else
         echo "Model weights (~52GB) are cached locally to avoid re-downloading."
     fi
@@ -311,6 +312,8 @@ GPU_MEMORY_UTIL=${GPU_MEMORY_UTIL}
 MAX_MODEL_LEN=${MAX_MODEL_LEN}
 MAX_NUM_SEQS=${MAX_NUM_SEQS}
 KV_CACHE_DTYPE=${KV_CACHE_DTYPE}
+VLLM_TEST_FORCE_FP8_MARLIN=${VLLM_TEST_FORCE_FP8_MARLIN}
+VLLM_USE_DEEP_GEMM=${VLLM_USE_DEEP_GEMM}
 
 # OCR
 OCR_CHUNK_SIZE=${OCR_CHUNK_SIZE}
@@ -384,7 +387,7 @@ deploy() {
     echo ""
     info "Waiting for vLLM to load the model..."
     if [[ "$MODEL_CHOICE" == "qwen35" ]]; then
-        info "Qwen 3.5 35B is ~70GB. First request may take ~60s to warm up."
+        info "Qwen 3.5 35B FP8 is ~35GB. First request may take ~60s to warm up."
     else
         info "Gemma 4 26B is ~52GB. This takes several minutes."
     fi

@@ -15,6 +15,8 @@ services:
       - "${VLLM_PORT:-8000}:${VLLM_PORT:-8000}"
     environment:
       - VLLM_FLASHINFER_MOE_BACKEND=latency
+      - VLLM_TEST_FORCE_FP8_MARLIN=${VLLM_TEST_FORCE_FP8_MARLIN:-0}
+      - VLLM_USE_DEEP_GEMM=${VLLM_USE_DEEP_GEMM:-1}
       - HF_TOKEN=${HF_TOKEN}
       - HF_MODEL_ID=${HF_MODEL_ID:-google/gemma-4-26B-A4B-it}
       - SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-gemma-4-26b}
