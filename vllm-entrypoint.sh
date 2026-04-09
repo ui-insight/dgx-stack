@@ -3,7 +3,7 @@
 # space-separated string from .env and properly split into arguments.
 set -euo pipefail
 
-exec python -m vllm.entrypoints.openai.api_server \
+exec python3 -m vllm.entrypoints.openai.api_server \
     --model "${HF_MODEL_ID}" \
     --served-model-name "${SERVED_MODEL_NAME}" \
     --host 0.0.0.0 \
