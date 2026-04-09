@@ -12,7 +12,7 @@ services:
     ipc: host
     shm_size: "64gb"
     ports:
-      - "8000:8000"
+      - "${VLLM_PORT:-8000}:${VLLM_PORT:-8000}"
     environment:
       - VLLM_FLASHINFER_MOE_BACKEND=latency
       - HF_TOKEN=${HF_TOKEN}
@@ -26,18 +26,18 @@ services:
       - --host
       - "0.0.0.0"
       - --port
-      - "8000"
+      - "${VLLM_PORT:-8000}"
       - --kv-cache-dtype
       - fp8
       - --max-model-len
-      - "131072"
+      - "${MAX_MODEL_LEN:-131072}"
       - --gpu-memory-utilization
-      - "0.75"
+      - "${GPU_MEMORY_UTIL:-0.75}"
       - --max-num-seqs
-      - "4"
+      - "${MAX_NUM_SEQS:-4}"
       - --trust-remote-code
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:${VLLM_PORT:-8000}/health"]
       interval: 30s
       timeout: 10s
       retries: 20
@@ -50,21 +50,21 @@ services:
       dockerfile: Dockerfile
     container_name: ocr-service
     ports:
-      - "8001:8001"
+      - "${OCR_PORT:-8001}:${OCR_PORT:-8001}"
     environment:
-      - VLLM_BASE_URL=http://vllm:8000
+      - VLLM_BASE_URL=http://vllm:${VLLM_PORT:-8000}
       - VLLM_MODEL=gemma-4-26b
-      - OCR_PORT=8001
-      - OCR_CHUNK_SIZE=6
-      - OCR_OVERLAP=2
-      - OCR_DPI=200
-      - OCR_MAX_TOKENS=16384
-      - OCR_TEMPERATURE=0.1
-      - OCR_MAX_CONCURRENT_CHUNKS=4
+      - OCR_PORT=${OCR_PORT:-8001}
+      - OCR_CHUNK_SIZE=${OCR_CHUNK_SIZE:-6}
+      - OCR_OVERLAP=${OCR_OVERLAP:-2}
+      - OCR_DPI=${OCR_DPI:-200}
+      - OCR_MAX_TOKENS=${OCR_MAX_TOKENS:-16384}
+      - OCR_TEMPERATURE=${OCR_TEMPERATURE:-0.1}
+      - OCR_MAX_CONCURRENT_CHUNKS=${OCR_MAX_CONCURRENT_CHUNKS:-4}
       - OCR_MIN_CHARS_PER_PAGE=400
       - OCR_MAX_RETRIES=2
-      - OCR_MAX_PAGES=200
-      - OCR_MAX_FILE_SIZE_MB=100
+      - OCR_MAX_PAGES=${OCR_MAX_PAGES:-200}
+      - OCR_MAX_FILE_SIZE_MB=${OCR_MAX_FILE_SIZE_MB:-100}
     depends_on:
       vllm:
         condition: service_healthy

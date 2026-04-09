@@ -1,0 +1,181 @@
+# DGX Stack
+
+Two-container stack for running **Gemma 4 26B** multimodal on an **NVIDIA DGX Spark** (ARM Grace CPU + Blackwell GPU, 128GB unified memory).
+
+- **vLLM container** — serves Gemma 4 26B via an OpenAI-compatible API with FP8 KV cache and 128K context
+- **OCR container** — converts PDFs, images, and Office documents to markdown using the vision model
+
+## Prerequisites
+
+- NVIDIA DGX Spark (or any Grace-Blackwell system with CUDA 13)
+- Docker Engine with [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/)
+- A [HuggingFace token](https://huggingface.co/settings/tokens) with access to [google/gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it)
+
+## Quick Start
+
+```bash
+git clone https://github.com/ui-insight/dgx-stack.git
+cd dgx-stack
+./setup.sh
+```
+
+The setup script walks you through configuration (ports, memory limits, HuggingFace token) and optionally deploys immediately.
+
+## Manual Setup
+
+If you prefer to configure manually:
+
+```bash
+cp .env.example .env
+# Edit .env with your settings
+docker compose up -d
+```
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  DGX Spark (128GB unified memory)                       │
+│                                                         │
+│  ┌──────────────────┐      ┌──────────────────────┐     │
+│  │  vLLM             │      │  OCR Service          │     │
+│  │  :8000             │◄─────│  :8001                │     │
+│  │                    │      │                       │     │
+│  │  gemma-4-26b       │      │  /v1/ocr   (JSON)     │     │
+│  │  BF16 + FP8 KV     │      │  /v1/ocrmd (markdown) │     │
+│  │  128K context       │      │                       │     │
+│  └──────────────────┘      └──────────────────────┘     │
+└─────────────────────────────────────────────────────────┘
+```
+
+### OCR Pipeline
+
+1. **Convert** — PDF pages (via poppler), images, or Office docs (via LibreOffice) are converted to PNG images
+2. **Chunk** — Pages are grouped into overlapping windows (default: 6 pages/chunk, 2-page overlap)
+3. **Infer** — Each chunk is sent to Gemma 4's vision capabilities for markdown extraction (parallel, up to 4 concurrent)
+4. **Retry** — Chunks with suspiciously short output are automatically retried with a stronger prompt
+5. **Merge** — Overlapping chunk outputs are stitched together using `difflib` sequence matching to eliminate duplicated content
+
+## API Reference
+
+### LLM — OpenAI-compatible (port 8000)
+
+Standard OpenAI chat completions API. Works with any OpenAI-compatible client.
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemma-4-26b",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "max_tokens": 256
+  }'
+```
+
+### OCR — JSON response (port 8001)
+
+`POST /v1/ocr` — Returns a JSON object with the extracted content and metadata.
+
+```bash
+curl -X POST http://localhost:8001/v1/ocr \
+  -F file=@document.pdf \
+  -F chunk_size=6 \
+  -F overlap=2 \
+  -F dpi=200
+```
+
+Response:
+
+```json
+{
+  "id": "ocr-a1b2c3d4e5f6a1b2c3d4e5f6",
+  "object": "ocr.result",
+  "created": 1712600000,
+  "model": "gemma-4-26b",
+  "content": "# Document Title\n\nExtracted markdown...",
+  "format": "markdown",
+  "pages": 12,
+  "chunks_processed": 3,
+  "usage": {
+    "prompt_tokens": 45000,
+    "completion_tokens": 8000,
+    "total_tokens": 53000
+  }
+}
+```
+
+### OCR — Raw markdown (port 8001)
+
+`POST /v1/ocrmd` — Returns the extracted markdown directly as `text/markdown`.
+
+```bash
+curl -X POST http://localhost:8001/v1/ocrmd -F file=@document.pdf
+```
+
+### OCR Parameters
+
+| Parameter    | Type | Default | Description                          |
+|-------------|------|---------|--------------------------------------|
+| `file`       | file | required | PDF, image, or Office document      |
+| `model`      | str  | gemma-4-26b | Override the vision model       |
+| `chunk_size` | int  | 6       | Pages per chunk                      |
+| `overlap`    | int  | 2       | Overlapping pages between chunks     |
+| `dpi`        | int  | 200     | PDF/Office rendering resolution      |
+
+### Supported File Types
+
+- **PDF** — `.pdf`
+- **Images** — `.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`, `.tiff`, `.bmp` (multi-frame supported)
+- **Office** — `.docx`, `.xlsx`, `.pptx`, `.doc`, `.xls`, `.ppt`
+
+## Configuration
+
+All settings live in `.env` (generated by `setup.sh`). Key options:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HF_TOKEN` | — | HuggingFace API token (required) |
+| `VLLM_PORT` | 8000 | vLLM API port |
+| `OCR_PORT` | 8001 | OCR service port |
+| `GPU_MEMORY_UTIL` | 0.75 | Fraction of 128GB unified memory for vLLM (~96GB) |
+| `MAX_MODEL_LEN` | 131072 | Max context length in tokens (up to 256K) |
+| `MAX_NUM_SEQS` | 4 | Max concurrent inference sequences |
+| `HF_CACHE` | ~/.cache/huggingface | Model weight cache directory |
+| `OCR_CHUNK_SIZE` | 6 | Pages per OCR chunk |
+| `OCR_OVERLAP` | 2 | Overlap pages between chunks |
+| `OCR_DPI` | 200 | PDF rendering DPI |
+| `OCR_MAX_TOKENS` | 16384 | Max LLM output tokens per chunk |
+| `OCR_MAX_CONCURRENT_CHUNKS` | 4 | Parallel chunk processing limit |
+| `OCR_MAX_PAGES` | 200 | Max pages per document |
+| `OCR_MAX_FILE_SIZE_MB` | 100 | Max upload size |
+
+## Operations
+
+```bash
+# View logs
+docker compose logs -f
+docker compose logs -f vllm
+docker compose logs -f ocr
+
+# Restart
+docker compose restart
+
+# Stop
+docker compose down
+
+# Update
+git pull
+docker compose build ocr
+docker compose pull vllm
+docker compose up -d
+
+# Reconfigure
+./setup.sh
+```
+
+## Important Notes
+
+- **No FP8 weight quantization** — Dynamic FP8 (`--quantization fp8`) produces gibberish on Gemma 4 (vllm-project/vllm#39049). This stack uses BF16 weights with FP8 KV cache, which works correctly.
+- **GPU memory** — The DGX Spark uses unified memory. Setting `GPU_MEMORY_UTIL` too high (>0.85) can starve the OS and OCR container. Default 0.75 leaves ~32GB headroom.
+- **First startup is slow** — The model (~52GB) must be downloaded on first run. Subsequent starts use the cached weights.
+- **Model access** — You must accept the Gemma 4 license on HuggingFace before the download will work.
