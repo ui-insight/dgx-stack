@@ -37,14 +37,14 @@ docker compose up -d
 ┌─────────────────────────────────────────────────────────┐
 │  DGX Spark (128GB unified memory)                       │
 │                                                         │
-│  ┌──────────────────┐      ┌──────────────────────┐     │
-│  │  vLLM             │      │  OCR Service          │     │
-│  │  :8000             │◄─────│  :8001                │     │
-│  │                    │      │                       │     │
-│  │  gemma-4-26b       │      │  /v1/ocr   (JSON)     │     │
-│  │  BF16 + FP8 KV     │      │  /v1/ocrmd (markdown) │     │
-│  │  128K context       │      │                       │     │
-│  └──────────────────┘      └──────────────────────┘     │
+│  ┌──────────────────┐      ┌────────────────────-──┐    │
+│  │  vLLM            │      │  OCR Service          │    │
+│  │  :8000           │◄─────│  :8001                │    │
+│  │                  │      │                       │    │
+│  │  gemma-4-26b     │      │  /v1/ocr   (JSON)     │    │
+│  │  BF16 + FP8 KV   │      │  /v1/ocrmd (markdown) │    │
+│  │  128K context    │      │                       │    │
+│  └──────────────────┘      └─────────────────────-─┘    │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -114,13 +114,13 @@ curl -X POST http://localhost:8001/v1/ocrmd -F file=@document.pdf
 
 ### OCR Parameters
 
-| Parameter    | Type | Default | Description                          |
-|-------------|------|---------|--------------------------------------|
-| `file`       | file | required | PDF, image, or Office document      |
-| `model`      | str  | gemma-4-26b | Override the vision model       |
-| `chunk_size` | int  | 6       | Pages per chunk                      |
-| `overlap`    | int  | 2       | Overlapping pages between chunks     |
-| `dpi`        | int  | 200     | PDF/Office rendering resolution      |
+| Parameter    | Type |  Default    | Description                          |
+|--------------|------|-------------|--------------------------------------|
+| `file`       | file | required    | PDF, image, or Office document       |
+| `model`      | str  | gemma-4-26b | Override the vision model            |
+| `chunk_size` | int  | 6           | Pages per chunk                      |
+| `overlap`    | int  | 2           | Overlapping pages between chunks     |
+| `dpi`        | int  | 200         | PDF/Office rendering resolution      |
 
 ### Supported File Types
 
