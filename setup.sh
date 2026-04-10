@@ -498,7 +498,7 @@ select_model() {
             DEFAULT_MAX_MODEL_LEN="131072"
             DEFAULT_GPU_MEMORY_UTIL="0.75"
             DEFAULT_KV_CACHE_DTYPE="fp8"
-            VLLM_EXTRA_FLAGS="--enable-prefix-caching --reasoning-parser qwen3 --max-num-batched-tokens 8192"
+            VLLM_EXTRA_FLAGS="--enable-prefix-caching --reasoning-parser deepseek_r1 --max-num-batched-tokens 8192"
             VLLM_TEST_FORCE_FP8_MARLIN=1
             VLLM_USE_DEEP_GEMM=0
             NEEDS_HF_TOKEN=false
