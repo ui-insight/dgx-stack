@@ -915,29 +915,81 @@ run_smoke_tests() {
     echo ""
     step "Test 2/3 — POST ${chat_url}/v1/chat/completions"
     if [[ -n "${served_id:-}" ]]; then
-        local chat_resp chat_content
-        chat_resp="$(curl -sf --max-time 120 "${chat_url}/v1/chat/completions" \
+        # Reasoning models (Qwen 3.5 with --reasoning-parser deepseek_r1) split
+        # output into reasoning_content + content. Ask for enough tokens to
+        # finish thinking *and* produce a final answer, and tell the template
+        # not to emit a thinking block when the model supports that hint.
+        local chat_body chat_resp http_code chat_content reasoning_content
+        chat_body="$(python3 - "$served_id" <<'PY'
+import json, sys
+model = sys.argv[1]
+print(json.dumps({
+    "model": model,
+    "messages": [
+        {"role": "system", "content": "You are a concise assistant. Answer directly without showing reasoning."},
+        {"role": "user",   "content": "In one sentence, what is an NVIDIA DGX Spark?"},
+    ],
+    "max_tokens": 1024,
+    "temperature": 0.2,
+    "chat_template_kwargs": {"enable_thinking": False},
+}))
+PY
+)"
+        # Capture body + HTTP status separately so we can report failures precisely.
+        local tmp_body
+        tmp_body="$(mktemp)"
+        http_code="$(curl -s -o "$tmp_body" -w '%{http_code}' --max-time 180 \
+            "${chat_url}/v1/chat/completions" \
             -H "Content-Type: application/json" \
-            -d "{
-                \"model\": \"${served_id}\",
-                \"messages\": [
-                    {\"role\": \"system\", \"content\": \"You are a concise assistant.\"},
-                    {\"role\": \"user\", \"content\": \"In one sentence, what is an NVIDIA DGX Spark?\"}
-                ],
-                \"max_tokens\": 128,
-                \"temperature\": 0.2
-            }" 2>/dev/null || true)"
-        chat_content="$(printf '%s' "$chat_resp" \
-            | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["choices"][0]["message"]["content"].strip())' 2>/dev/null || true)"
-        if [[ -n "$chat_content" ]]; then
-            info "Model response:"
-            echo -e "    ${DIM}${chat_content}${RESET}"
-            pass=$((pass + 1))
-        else
-            error "Chat completion failed or returned empty content."
-            printf '%s' "$chat_resp" | head -c 400
+            -d "$chat_body" || echo "000")"
+        chat_resp="$(cat "$tmp_body")"
+        rm -f "$tmp_body"
+
+        if [[ "$http_code" != "200" ]]; then
+            error "Chat completion HTTP ${http_code}."
+            printf '%s' "$chat_resp" | head -c 500
             echo
             fail=$((fail + 1))
+        else
+            # Pull content, reasoning_content, and finish_reason in one pass
+            local parsed
+            parsed="$(printf '%s' "$chat_resp" | python3 - <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    m = d["choices"][0]["message"]
+    content = (m.get("content") or "").strip()
+    reasoning = (m.get("reasoning_content") or "").strip()
+    finish = d["choices"][0].get("finish_reason", "")
+    print(f"FINISH={finish}")
+    print(f"CONTENT={content}")
+    print(f"REASONING_LEN={len(reasoning)}")
+except Exception as e:
+    print(f"PARSE_ERROR={e}")
+PY
+)"
+            chat_content="$(grep '^CONTENT=' <<< "$parsed" | sed 's/^CONTENT=//')"
+            local finish_reason reasoning_len
+            finish_reason="$(grep '^FINISH=' <<< "$parsed" | sed 's/^FINISH=//')"
+            reasoning_len="$(grep '^REASONING_LEN=' <<< "$parsed" | sed 's/^REASONING_LEN=//')"
+
+            if [[ -n "$chat_content" ]]; then
+                info "Model response (finish=${finish_reason}):"
+                echo -e "    ${DIM}${chat_content}${RESET}"
+                pass=$((pass + 1))
+            else
+                error "Chat completion returned empty content."
+                info  "  finish_reason=${finish_reason}  reasoning_content_len=${reasoning_len}"
+                if [[ "${reasoning_len:-0}" -gt 0 ]]; then
+                    warn "  Model produced reasoning tokens but no final answer."
+                    warn "  If using Qwen 3.5, the reasoning parser may be consuming all"
+                    warn "  max_tokens before emitting content. Try a higher limit or"
+                    warn "  remove --reasoning-parser from VLLM_EXTRA_FLAGS."
+                fi
+                printf '%s' "$chat_resp" | head -c 500
+                echo
+                fail=$((fail + 1))
+            fi
         fi
     else
         warn "Skipped (no served model id from test 1)."
@@ -951,34 +1003,58 @@ run_smoke_tests() {
         warn "Test PDF not found at ${test_pdf} — skipping."
         fail=$((fail + 1))
     else
-        # OCR container starts after vLLM is healthy, so it may need a moment.
-        local ocr_ready=false
-        for _ in 1 2 3 4 5 6; do
-            if curl -sf --max-time 5 "${ocr_url}/health" &>/dev/null \
-               || curl -sf --max-time 5 "${ocr_url}/" &>/dev/null; then
-                ocr_ready=true
-                break
-            fi
-            sleep 5
-        done
-        if [[ "$ocr_ready" != true ]]; then
-            warn "OCR service did not respond — attempting the request anyway."
-        fi
-
-        info "Uploading test PDF (3 pages)... this may take up to a minute."
-        local ocr_out
-        ocr_out="$(curl -sf --max-time 300 -X POST "${ocr_url}/v1/ocrmd" \
-            -F "file=@${test_pdf}" 2>/dev/null || true)"
-        if [[ -n "$ocr_out" ]] && grep -q "END-OF-TEST-DOCUMENT" <<< "$ocr_out"; then
-            local chars
-            chars=$(printf '%s' "$ocr_out" | wc -c | tr -d ' ')
-            info "OCR returned ${chars} chars and contains END-OF-TEST-DOCUMENT sentinel."
-            pass=$((pass + 1))
-        else
-            error "OCR response missing END-OF-TEST-DOCUMENT marker."
-            printf '%s' "$ocr_out" | head -c 400
-            echo
+        # Preflight: is the OCR container actually up, and is /health reachable?
+        local ocr_container_state ocr_health_code
+        ocr_container_state="$(docker inspect -f '{{.State.Status}}' ocr-service 2>/dev/null || echo 'missing')"
+        info "Container state: ${ocr_container_state}"
+        if [[ "$ocr_container_state" != "running" ]]; then
+            error "ocr-service container is not running."
+            info  "Recent logs (last 30 lines):"
+            docker logs --tail 30 ocr-service 2>&1 | sed 's/^/    /' || true
             fail=$((fail + 1))
+        else
+            local ocr_ready=false
+            for _ in 1 2 3 4 5 6; do
+                ocr_health_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+                    "${ocr_url}/health" 2>/dev/null || echo "000")"
+                if [[ "$ocr_health_code" == "200" ]]; then
+                    ocr_ready=true
+                    break
+                fi
+                sleep 5
+            done
+            if [[ "$ocr_ready" != true ]]; then
+                error "OCR /health did not return 200 (last HTTP code: ${ocr_health_code})."
+                info  "Recent logs (last 30 lines):"
+                docker logs --tail 30 ocr-service 2>&1 | sed 's/^/    /' || true
+                fail=$((fail + 1))
+            else
+                info "OCR /health OK — uploading test PDF (3 pages)..."
+                local ocr_tmp ocr_code
+                ocr_tmp="$(mktemp)"
+                ocr_code="$(curl -s -o "$ocr_tmp" -w '%{http_code}' --max-time 600 \
+                    -X POST "${ocr_url}/v1/ocrmd" \
+                    -F "file=@${test_pdf}" 2>/dev/null || echo "000")"
+                local ocr_out chars
+                ocr_out="$(cat "$ocr_tmp")"
+                rm -f "$ocr_tmp"
+                chars=$(printf '%s' "$ocr_out" | wc -c | tr -d ' ')
+
+                if [[ "$ocr_code" != "200" ]]; then
+                    error "OCR HTTP ${ocr_code} (${chars} chars returned)."
+                    printf '%s' "$ocr_out" | head -c 500
+                    echo
+                    fail=$((fail + 1))
+                elif grep -q "END-OF-TEST-DOCUMENT" <<< "$ocr_out"; then
+                    info "OCR returned ${chars} chars and contains END-OF-TEST-DOCUMENT sentinel."
+                    pass=$((pass + 1))
+                else
+                    error "OCR response (${chars} chars) missing END-OF-TEST-DOCUMENT marker."
+                    printf '%s' "$ocr_out" | head -c 500
+                    echo
+                    fail=$((fail + 1))
+                fi
+            fi
         fi
     fi
 
