@@ -789,6 +789,8 @@ deploy_start_and_wait() {
         return
     fi
 
+    run_smoke_tests
+
     echo ""
     echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════════════╗${RESET}"
     echo -e "${GREEN}${BOLD}║  Stack is running!                                      ║${RESET}"
@@ -806,6 +808,124 @@ deploy_start_and_wait() {
     echo "  Quick test:"
     echo "    curl -X POST http://localhost:${OCR_PORT}/v1/ocrmd -F file=@document.pdf"
     echo ""
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Smoke tests — exercise /v1/models, chat completions, and the OCR pipeline
+# against the committed examples/test-doc.pdf after a successful deploy.
+# ───────────────────────────────────────────────────────────────────────────
+
+run_smoke_tests() {
+    echo ""
+    if ! confirm "Run end-to-end smoke tests now?" "y"; then
+        return
+    fi
+
+    local pass=0 fail=0
+    local chat_url="http://localhost:${VLLM_PORT}"
+    local ocr_url="http://localhost:${OCR_PORT}"
+    local test_pdf="${SCRIPT_DIR}/examples/test-doc.pdf"
+
+    # ── Test 1: /v1/models ─────────────────────────────────────────────────
+    echo ""
+    step "Test 1/3 — GET ${chat_url}/v1/models"
+    local models_json served_id
+    if models_json="$(curl -sf --max-time 15 "${chat_url}/v1/models" 2>/dev/null)"; then
+        served_id="$(printf '%s' "$models_json" \
+            | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["data"][0]["id"])' 2>/dev/null || true)"
+        if [[ -n "$served_id" ]]; then
+            info "Served model id: ${BOLD}${served_id}${RESET}"
+            pass=$((pass + 1))
+        else
+            error "Could not parse model id from response."
+            echo "$models_json" | head -c 400
+            echo
+            fail=$((fail + 1))
+        fi
+    else
+        error "Request to /v1/models failed."
+        fail=$((fail + 1))
+    fi
+
+    # ── Test 2: chat completions ───────────────────────────────────────────
+    echo ""
+    step "Test 2/3 — POST ${chat_url}/v1/chat/completions"
+    if [[ -n "${served_id:-}" ]]; then
+        local chat_resp chat_content
+        chat_resp="$(curl -sf --max-time 120 "${chat_url}/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -d "{
+                \"model\": \"${served_id}\",
+                \"messages\": [
+                    {\"role\": \"system\", \"content\": \"You are a concise assistant.\"},
+                    {\"role\": \"user\", \"content\": \"In one sentence, what is an NVIDIA DGX Spark?\"}
+                ],
+                \"max_tokens\": 128,
+                \"temperature\": 0.2
+            }" 2>/dev/null || true)"
+        chat_content="$(printf '%s' "$chat_resp" \
+            | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["choices"][0]["message"]["content"].strip())' 2>/dev/null || true)"
+        if [[ -n "$chat_content" ]]; then
+            info "Model response:"
+            echo -e "    ${DIM}${chat_content}${RESET}"
+            pass=$((pass + 1))
+        else
+            error "Chat completion failed or returned empty content."
+            printf '%s' "$chat_resp" | head -c 400
+            echo
+            fail=$((fail + 1))
+        fi
+    else
+        warn "Skipped (no served model id from test 1)."
+        fail=$((fail + 1))
+    fi
+
+    # ── Test 3: OCR pipeline ───────────────────────────────────────────────
+    echo ""
+    step "Test 3/3 — POST ${ocr_url}/v1/ocrmd  (examples/test-doc.pdf)"
+    if [[ ! -f "$test_pdf" ]]; then
+        warn "Test PDF not found at ${test_pdf} — skipping."
+        fail=$((fail + 1))
+    else
+        # OCR container starts after vLLM is healthy, so it may need a moment.
+        local ocr_ready=false
+        for _ in 1 2 3 4 5 6; do
+            if curl -sf --max-time 5 "${ocr_url}/health" &>/dev/null \
+               || curl -sf --max-time 5 "${ocr_url}/" &>/dev/null; then
+                ocr_ready=true
+                break
+            fi
+            sleep 5
+        done
+        if [[ "$ocr_ready" != true ]]; then
+            warn "OCR service did not respond — attempting the request anyway."
+        fi
+
+        info "Uploading test PDF (3 pages)... this may take up to a minute."
+        local ocr_out
+        ocr_out="$(curl -sf --max-time 300 -X POST "${ocr_url}/v1/ocrmd" \
+            -F "file=@${test_pdf}" 2>/dev/null || true)"
+        if [[ -n "$ocr_out" ]] && grep -q "END-OF-TEST-DOCUMENT" <<< "$ocr_out"; then
+            local chars
+            chars=$(printf '%s' "$ocr_out" | wc -c | tr -d ' ')
+            info "OCR returned ${chars} chars and contains END-OF-TEST-DOCUMENT sentinel."
+            pass=$((pass + 1))
+        else
+            error "OCR response missing END-OF-TEST-DOCUMENT marker."
+            printf '%s' "$ocr_out" | head -c 400
+            echo
+            fail=$((fail + 1))
+        fi
+    fi
+
+    # ── Summary ────────────────────────────────────────────────────────────
+    echo ""
+    if (( fail == 0 )); then
+        echo -e "${GREEN}${BOLD}  Smoke tests: ${pass}/3 passed ✓${RESET}"
+    else
+        echo -e "${YELLOW}${BOLD}  Smoke tests: ${pass}/3 passed, ${fail} failed${RESET}"
+        echo -e "${DIM}  Check logs:  docker compose logs -f${RESET}"
+    fi
 }
 
 # ───────────────────────────────────────────────────────────────────────────
