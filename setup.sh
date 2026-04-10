@@ -1090,8 +1090,10 @@ run_smoke_tests() {
         # Note: do NOT pass chat_template_kwargs.enable_thinking=false here.
         # On Qwen 3.5 + --reasoning-parser deepseek_r1 that combination
         # causes the parser to misclassify the final answer as reasoning
-        # and leave the content field null. Letting the model emit its
-        # normal <think> block produces a clean content/reasoning split.
+        # For reasoning models we disable thinking so the request returns
+        # fast without burning tokens on a <think> block. This relies on
+        # VLLM_ENABLE_THINKING_DEFAULT being plumbed through at serve time;
+        # the chat_template_kwargs override is a no-op on Gemma.
         chat_body="$(python3 -c '
 import json, sys
 print(json.dumps({
@@ -1099,8 +1101,9 @@ print(json.dumps({
     "messages": [
         {"role": "user", "content": "In one sentence, what is an NVIDIA DGX Spark?"},
     ],
-    "max_tokens": 16384,
+    "max_tokens": 4096,
     "temperature": 0.2,
+    "chat_template_kwargs": {"enable_thinking": False},
 }))
 ' "$served_id")"
         # Capture body + HTTP status separately so we can report failures precisely.
