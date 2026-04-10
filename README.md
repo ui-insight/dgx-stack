@@ -261,6 +261,24 @@ docker compose pull vllm
 docker compose up -d
 ```
 
+## Networking
+
+The stack pins its Compose network explicitly to **`10.10.0.0/24`** so it
+never lands in the default `172.16.0.0/12` pool. Both containers live on
+a bridge network named `dgx-net`.
+
+If you want every Docker network on the host (not just this stack) to
+allocate from `10.10.0.0/16`, a template daemon config ships in
+[`docker/daemon.json`](docker/daemon.json). Install it via
+`./setup.sh` → **Configure Networks**, which will:
+
+1. Back up any existing `/etc/docker/daemon.json`
+2. Merge the `default-address-pools` setting into the config
+3. Restart `docker.service` (briefly stops all containers on the host)
+
+After the restart, every new Docker network — including this stack's —
+allocates from `10.10.0.0/16` in `/24` slices. Nothing lands on `172.x.x.x`.
+
 ## Important Notes
 
 - **No FP8 weight quantization** — Dynamic FP8 (`--quantization fp8`) produces gibberish on Gemma 4 (vllm-project/vllm#39049). This stack uses BF16 weights with FP8 KV cache, which works correctly.

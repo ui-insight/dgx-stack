@@ -38,6 +38,8 @@ services:
       retries: 20
       start_period: 300s
     restart: unless-stopped
+    networks:
+      - dgx-net
 
   ocr:
     build:
@@ -64,3 +66,15 @@ services:
       vllm:
         condition: service_healthy
     restart: unless-stopped
+    networks:
+      - dgx-net
+
+networks:
+  dgx-net:
+    name: dgx-net
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.10.0.0/24
+          gateway: 10.10.0.1

@@ -173,6 +173,7 @@ main_menu() {
     echo -e "  ${BOLD}4)${RESET} Test              ${DIM}— run health + end-to-end checks on the running stack${RESET}"
     echo -e "  ${BOLD}5)${RESET} Turn Off          ${DIM}— stop all containers${RESET}"
     echo -e "  ${BOLD}6)${RESET} View Logs         ${DIM}— tail container logs${RESET}"
+    echo -e "  ${BOLD}7)${RESET} Configure Networks ${DIM}— install /etc/docker/daemon.json to use 10.10.x.x${RESET}"
     echo -e "  ${BOLD}q)${RESET} Quit"
     echo ""
 
@@ -187,6 +188,7 @@ main_menu() {
         4) action_test ;;
         5) action_turn_off ;;
         6) action_view_logs ;;
+        7) action_configure_networks ;;
         q|Q) echo "Goodbye."; exit 0 ;;
         *)
             error "Invalid choice."
@@ -378,6 +380,142 @@ action_test() {
     run_smoke_tests
 
     echo ""
+    confirm "Return to menu?" "y" && main_menu
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Action: Configure Networks
+# Install /etc/docker/daemon.json so Docker allocates ALL networks (not just
+# this stack's) from 10.10.0.0/16 instead of the default 172.16.0.0/12 pool.
+# This avoids conflicts with sites that already use 172.x.x.x.
+# ───────────────────────────────────────────────────────────────────────────
+
+action_configure_networks() {
+    echo ""
+    step "Configure Docker Networks (10.10.0.0/16)"
+    echo ""
+
+    local template="${SCRIPT_DIR}/docker/daemon.json"
+    local target="/etc/docker/daemon.json"
+
+    if [[ ! -f "$template" ]]; then
+        error "Template not found at ${template}"
+        echo ""
+        confirm "Return to menu?" "y" && main_menu
+        return
+    fi
+
+    echo "This will configure the Docker daemon to allocate all networks"
+    echo "(not just this stack) from the 10.10.0.0/16 range instead of the"
+    echo "default 172.16.0.0/12 pool. Useful when 172.x.x.x conflicts with"
+    echo "corporate routes, VPNs, or other services."
+    echo ""
+    echo "  Source:  ${template}"
+    echo "  Target:  ${target}"
+    echo ""
+    echo "Steps:"
+    echo "  1. Back up any existing ${target} to ${target}.bak-<timestamp>"
+    echo "  2. Merge the default-address-pools setting into the config"
+    echo "     (or write a fresh file if none exists)"
+    echo "  3. Restart docker.service"
+    echo ""
+    warn "Restarting the Docker daemon will briefly stop ALL containers on"
+    warn "this host, including containers outside this stack."
+    echo ""
+
+    if ! confirm "Proceed?" "n"; then
+        echo ""
+        main_menu
+        return
+    fi
+
+    # Must be root (or able to sudo) to touch /etc/docker.
+    local SUDO=""
+    if [[ $EUID -ne 0 ]]; then
+        if command -v sudo &>/dev/null; then
+            SUDO="sudo"
+            info "Will use sudo for /etc/docker writes and systemctl."
+        else
+            error "Not running as root and sudo is not available."
+            echo ""
+            confirm "Return to menu?" "y" && main_menu
+            return
+        fi
+    fi
+
+    $SUDO mkdir -p /etc/docker
+
+    local ts
+    ts="$(date +%Y%m%d-%H%M%S)"
+
+    if [[ -f "$target" ]]; then
+        info "Existing ${target} found. Backing up to ${target}.bak-${ts}"
+        $SUDO cp "$target" "${target}.bak-${ts}"
+
+        # Merge: keep everything in the existing file, override/add
+        # default-address-pools with our value.
+        local merged
+        if ! merged="$(python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    existing = json.load(f)
+with open(sys.argv[2]) as f:
+    ours = json.load(f)
+existing["default-address-pools"] = ours["default-address-pools"]
+sys.stdout.write(json.dumps(existing, indent=2) + "\n")
+' "$target" "$template" 2>/dev/null)"; then
+            error "Failed to merge existing ${target} with template."
+            error "Existing file may contain invalid JSON. Aborting."
+            echo ""
+            confirm "Return to menu?" "y" && main_menu
+            return
+        fi
+        printf '%s' "$merged" | $SUDO tee "$target" >/dev/null
+    else
+        info "No existing ${target}; writing fresh template."
+        $SUDO cp "$template" "$target"
+    fi
+
+    info "Wrote ${target}:"
+    $SUDO cat "$target" | sed 's/^/    /'
+
+    echo ""
+    step "Restarting docker.service..."
+    if ! $SUDO systemctl restart docker; then
+        error "docker.service restart failed."
+        error "Check:  $SUDO systemctl status docker"
+        echo ""
+        confirm "Return to menu?" "y" && main_menu
+        return
+    fi
+
+    # Wait a few seconds for the daemon to come back.
+    local waited=0
+    while (( waited < 20 )); do
+        if docker info &>/dev/null; then
+            break
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    if ! docker info &>/dev/null; then
+        warn "Docker daemon did not respond within 20s after restart."
+        warn "It may still be coming up. Run: docker info"
+    else
+        info "Docker daemon is back up."
+        echo ""
+        info "docker0 address:"
+        ip -4 addr show docker0 2>/dev/null | grep -oE 'inet [0-9.]+/[0-9]+' \
+            | sed 's/^/    /' || echo "    (docker0 not yet assigned)"
+    fi
+
+    echo ""
+    info "Done. New networks will allocate from 10.10.0.0/16 in /24 slices."
+    info "Existing networks keep their old subnets until recreated."
+    info "To move this stack onto the new pool, run Re-Install (option 2)."
+    echo ""
+
     confirm "Return to menu?" "y" && main_menu
 }
 
