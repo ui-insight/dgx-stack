@@ -170,8 +170,9 @@ main_menu() {
     echo -e "  ${BOLD}1)${RESET} Fresh Install     ${DIM}— configure from scratch, deploy${RESET}"
     echo -e "  ${BOLD}2)${RESET} Re-Install        ${DIM}— rebuild containers, redeploy with current config${RESET}"
     echo -e "  ${BOLD}3)${RESET} Repair/Reconfigure ${DIM}— change settings and restart${RESET}"
-    echo -e "  ${BOLD}4)${RESET} Turn Off          ${DIM}— stop all containers${RESET}"
-    echo -e "  ${BOLD}5)${RESET} View Logs         ${DIM}— tail container logs${RESET}"
+    echo -e "  ${BOLD}4)${RESET} Test              ${DIM}— run health + end-to-end checks on the running stack${RESET}"
+    echo -e "  ${BOLD}5)${RESET} Turn Off          ${DIM}— stop all containers${RESET}"
+    echo -e "  ${BOLD}6)${RESET} View Logs         ${DIM}— tail container logs${RESET}"
     echo -e "  ${BOLD}q)${RESET} Quit"
     echo ""
 
@@ -183,8 +184,9 @@ main_menu() {
         1) action_fresh_install ;;
         2) action_reinstall ;;
         3) action_repair ;;
-        4) action_turn_off ;;
-        5) action_view_logs ;;
+        4) action_test ;;
+        5) action_turn_off ;;
+        6) action_view_logs ;;
         q|Q) echo "Goodbye."; exit 0 ;;
         *)
             error "Invalid choice."
@@ -315,6 +317,68 @@ action_repair() {
     write_env
     stop_and_remove_containers
     deploy_start_and_wait
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Action: Test
+# Run non-destructive health + end-to-end checks on the running stack.
+# ───────────────────────────────────────────────────────────────────────────
+
+action_test() {
+    echo ""
+    step "Test"
+    echo ""
+
+    if [[ "$HAS_ENV" != true ]]; then
+        error "No .env found. There is nothing deployed to test."
+        echo ""
+        confirm "Return to menu?" "y" && main_menu
+        return
+    fi
+
+    # Make sure VLLM_PORT / OCR_PORT etc. are in the environment for the checks.
+    load_env_values
+
+    if [[ "$VLLM_RUNNING" != true ]] && [[ "$OCR_RUNNING" != true ]]; then
+        error "Neither vllm-server nor ocr-service is running."
+        info  "Start the stack with Re-Install (option 2) or 'docker compose up -d'."
+        echo ""
+        confirm "Return to menu?" "y" && main_menu
+        return
+    fi
+
+    # ── Container / port health ────────────────────────────────────────────
+    echo -e "${BOLD}── Container health ──${RESET}"
+    if [[ "$VLLM_RUNNING" == true ]]; then
+        info "vllm-server is running"
+    else
+        error "vllm-server is NOT running"
+    fi
+    if [[ "$OCR_RUNNING" == true ]]; then
+        info "ocr-service is running"
+    else
+        error "ocr-service is NOT running"
+    fi
+
+    echo ""
+    echo -e "${BOLD}── HTTP health ──${RESET}"
+    if curl -sf --max-time 5 "http://localhost:${VLLM_PORT}/health" &>/dev/null; then
+        info "vLLM  /health  OK  (port ${VLLM_PORT})"
+    else
+        error "vLLM  /health  failed  (port ${VLLM_PORT})"
+    fi
+    if curl -sf --max-time 5 "http://localhost:${OCR_PORT}/health" &>/dev/null \
+       || curl -sf --max-time 5 "http://localhost:${OCR_PORT}/" &>/dev/null; then
+        info "OCR   /       OK  (port ${OCR_PORT})"
+    else
+        warn "OCR service did not respond on port ${OCR_PORT}"
+    fi
+
+    # ── End-to-end smoke tests ─────────────────────────────────────────────
+    run_smoke_tests
+
+    echo ""
+    confirm "Return to menu?" "y" && main_menu
 }
 
 # ───────────────────────────────────────────────────────────────────────────
