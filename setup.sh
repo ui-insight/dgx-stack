@@ -427,6 +427,7 @@ load_env_values() {
     GPU_MEMORY_UTIL="${GPU_MEMORY_UTIL:-0.75}"
     MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
     MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
+    MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
     KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
     OCR_CHUNK_SIZE="${OCR_CHUNK_SIZE:-6}"
     OCR_OVERLAP="${OCR_OVERLAP:-2}"
@@ -441,12 +442,14 @@ load_env_values() {
         MODEL_CHOICE="gemma4"
         NEEDS_HF_TOKEN=true
         DEFAULT_MAX_MODEL_LEN="131072"
+        DEFAULT_MAX_NUM_BATCHED_TOKENS="8192"
         DEFAULT_GPU_MEMORY_UTIL="0.75"
         DEFAULT_KV_CACHE_DTYPE="fp8"
     else
         MODEL_CHOICE="qwen35"
         NEEDS_HF_TOKEN=false
         DEFAULT_MAX_MODEL_LEN="131072"
+        DEFAULT_MAX_NUM_BATCHED_TOKENS="8192"
         DEFAULT_GPU_MEMORY_UTIL="0.75"
         DEFAULT_KV_CACHE_DTYPE="fp8"
     fi
@@ -482,9 +485,10 @@ select_model() {
             HF_MODEL_ID="google/gemma-4-26B-A4B-it"
             SERVED_MODEL_NAME="gemma-4-26b"
             DEFAULT_MAX_MODEL_LEN="131072"
+            DEFAULT_MAX_NUM_BATCHED_TOKENS="8192"
             DEFAULT_GPU_MEMORY_UTIL="0.75"
             DEFAULT_KV_CACHE_DTYPE="fp8"
-            VLLM_EXTRA_FLAGS=""
+            VLLM_EXTRA_FLAGS="--no-enable-prefix-caching"
             VLLM_TEST_FORCE_FP8_MARLIN=0
             VLLM_USE_DEEP_GEMM=1
             NEEDS_HF_TOKEN=true
@@ -496,9 +500,10 @@ select_model() {
             HF_MODEL_ID="Qwen/Qwen3.5-35B-A3B-FP8"
             SERVED_MODEL_NAME="qwen3.5-35b"
             DEFAULT_MAX_MODEL_LEN="131072"
+            DEFAULT_MAX_NUM_BATCHED_TOKENS="8192"
             DEFAULT_GPU_MEMORY_UTIL="0.75"
             DEFAULT_KV_CACHE_DTYPE="fp8"
-            VLLM_EXTRA_FLAGS="--enable-prefix-caching --reasoning-parser deepseek_r1 --max-num-batched-tokens 8192"
+            VLLM_EXTRA_FLAGS="--enable-prefix-caching --reasoning-parser deepseek_r1"
             VLLM_TEST_FORCE_FP8_MARLIN=1
             VLLM_USE_DEEP_GEMM=0
             NEEDS_HF_TOKEN=false
@@ -600,6 +605,7 @@ configure_interactive() {
     echo -e "${BOLD}── Model Configuration ──${RESET}"
     ask "Max context length (tokens)" "${MAX_MODEL_LEN:-$DEFAULT_MAX_MODEL_LEN}" MAX_MODEL_LEN
     ask "Max concurrent sequences" "${MAX_NUM_SEQS:-4}" MAX_NUM_SEQS
+    ask "Max batched tokens (required ≥ Mamba block size for Qwen)" "${MAX_NUM_BATCHED_TOKENS:-$DEFAULT_MAX_NUM_BATCHED_TOKENS}" MAX_NUM_BATCHED_TOKENS
     echo ""
 
     # ── KV Cache ──
@@ -697,6 +703,7 @@ GPU_MEMORY_UTIL=${GPU_MEMORY_UTIL}
 MAX_MODEL_LEN=${MAX_MODEL_LEN}
 MAX_NUM_SEQS=${MAX_NUM_SEQS}
 KV_CACHE_DTYPE=${KV_CACHE_DTYPE}
+MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS}
 VLLM_TEST_FORCE_FP8_MARLIN=${VLLM_TEST_FORCE_FP8_MARLIN}
 VLLM_USE_DEEP_GEMM=${VLLM_USE_DEEP_GEMM}
 
