@@ -388,11 +388,30 @@ stop_and_remove_containers() {
 }
 
 load_env_values() {
-    # Source .env into the current shell to populate variables
-    set -a
-    # shellcheck disable=SC1091
-    source .env
-    set +a
+    # Parse .env manually — never use `source` because values may contain
+    # spaces or flag-like tokens that bash would try to execute.
+    local line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip comments and blank lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+        # Must contain =
+        [[ "$line" != *=* ]] && continue
+        key="${line%%=*}"
+        value="${line#*=}"
+        # Trim leading whitespace from key
+        key="${key#"${key%%[![:space:]]*}"}"
+        key="${key%"${key##*[![:space:]]}"}"
+        # Strip surrounding single or double quotes from value
+        if [[ "$value" =~ ^\"(.*)\"$ ]]; then
+            value="${BASH_REMATCH[1]}"
+        elif [[ "$value" =~ ^\'(.*)\'$ ]]; then
+            value="${BASH_REMATCH[1]}"
+        fi
+        # Only allow valid identifier keys
+        [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+        printf -v "$key" '%s' "$value"
+    done < .env
 
     # Set defaults for anything missing
     VLLM_IMAGE="${VLLM_IMAGE:-vllm/vllm-openai:gemma4-cu130}"
