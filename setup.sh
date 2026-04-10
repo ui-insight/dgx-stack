@@ -928,7 +928,7 @@ print(json.dumps({
         {"role": "system", "content": "You are a concise assistant. Answer directly without showing reasoning."},
         {"role": "user",   "content": "In one sentence, what is an NVIDIA DGX Spark?"},
     ],
-    "max_tokens": 1024,
+    "max_tokens": 16384,
     "temperature": 0.2,
     "chat_template_kwargs": {"enable_thinking": False},
 }))
