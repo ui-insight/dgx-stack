@@ -660,14 +660,14 @@ write_env() {
 # ─────────────────────────────────────────────
 
 # Model
-VLLM_IMAGE=${VLLM_IMAGE}
-HF_MODEL_ID=${HF_MODEL_ID}
-SERVED_MODEL_NAME=${SERVED_MODEL_NAME}
-VLLM_EXTRA_FLAGS=${VLLM_EXTRA_FLAGS:---no-enable-prefix-caching}
+VLLM_IMAGE="${VLLM_IMAGE}"
+HF_MODEL_ID="${HF_MODEL_ID}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME}"
+VLLM_EXTRA_FLAGS="${VLLM_EXTRA_FLAGS:---no-enable-prefix-caching}"
 
 # HuggingFace
-HF_TOKEN=${HF_TOKEN}
-HF_CACHE=${HF_CACHE}
+HF_TOKEN="${HF_TOKEN}"
+HF_CACHE="${HF_CACHE}"
 
 # Network
 VLLM_PORT=${VLLM_PORT}
