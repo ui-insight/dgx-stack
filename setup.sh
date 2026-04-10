@@ -939,7 +939,8 @@ print(json.dumps({
         http_code="$(curl -s -o "$tmp_body" -w '%{http_code}' --max-time 180 \
             "${chat_url}/v1/chat/completions" \
             -H "Content-Type: application/json" \
-            -d "$chat_body" || echo "000")"
+            -d "$chat_body" 2>/dev/null)"
+        [[ -z "$http_code" ]] && http_code="000"
         chat_resp="$(cat "$tmp_body")"
         rm -f "$tmp_body"
 
@@ -1025,8 +1026,12 @@ except Exception as e:
         else
             local ocr_ready=false
             for _ in 1 2 3 4 5 6; do
+                # curl -w writes %{http_code} to stdout even on connection
+                # failure (it writes "000"), so do NOT add `|| echo 000` —
+                # that would concatenate two copies of the failure code.
                 ocr_health_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-                    "${ocr_url}/health" 2>/dev/null || echo "000")"
+                    "${ocr_url}/health" 2>/dev/null)"
+                [[ -z "$ocr_health_code" ]] && ocr_health_code="000"
                 if [[ "$ocr_health_code" == "200" ]]; then
                     ocr_ready=true
                     break
@@ -1044,7 +1049,8 @@ except Exception as e:
                 ocr_tmp="$(mktemp)"
                 ocr_code="$(curl -s -o "$ocr_tmp" -w '%{http_code}' --max-time 600 \
                     -X POST "${ocr_url}/v1/ocrmd" \
-                    -F "file=@${test_pdf}" 2>/dev/null || echo "000")"
+                    -F "file=@${test_pdf}" 2>/dev/null)"
+                [[ -z "$ocr_code" ]] && ocr_code="000"
                 local ocr_out chars
                 ocr_out="$(cat "$ocr_tmp")"
                 rm -f "$ocr_tmp"
