@@ -11,8 +11,21 @@ echo "  MAX_NUM_SEQS=${MAX_NUM_SEQS:-4}"
 echo "  MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-8192}"
 echo "  KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-fp8}"
 echo "  GPU_MEMORY_UTIL=${GPU_MEMORY_UTIL:-0.75}"
+echo "  VLLM_ENABLE_THINKING_DEFAULT=${VLLM_ENABLE_THINKING_DEFAULT:-}"
 echo "  VLLM_EXTRA_FLAGS=${VLLM_EXTRA_FLAGS:-}"
 echo "=========================="
+
+# Build an optional --default-chat-template-kwargs flag for models that
+# support toggling thinking per-request (e.g. Qwen 3.5 with
+# --reasoning-parser deepseek_r1). Setting the serve-time default is what
+# makes the per-request enable_thinking=false override actually work.
+# Using a bash array preserves the embedded JSON as a single argv entry
+# regardless of the quoting in VLLM_EXTRA_FLAGS.
+THINKING_FLAG=()
+if [[ -n "${VLLM_ENABLE_THINKING_DEFAULT:-}" ]]; then
+    THINKING_FLAG=(--default-chat-template-kwargs "{\"enable_thinking\":${VLLM_ENABLE_THINKING_DEFAULT}}")
+    echo "  → adding ${THINKING_FLAG[*]}"
+fi
 
 exec python3 -m vllm.entrypoints.openai.api_server \
     --model "${HF_MODEL_ID}" \
@@ -25,4 +38,5 @@ exec python3 -m vllm.entrypoints.openai.api_server \
     --gpu-memory-utilization "${GPU_MEMORY_UTIL:-0.75}" \
     --max-num-seqs "${MAX_NUM_SEQS:-4}" \
     --trust-remote-code \
+    "${THINKING_FLAG[@]}" \
     ${VLLM_EXTRA_FLAGS:-}

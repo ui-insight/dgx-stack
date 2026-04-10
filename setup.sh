@@ -622,6 +622,7 @@ load_env_values() {
     VLLM_EXTRA_FLAGS="${VLLM_EXTRA_FLAGS:---no-enable-prefix-caching}"
     VLLM_TEST_FORCE_FP8_MARLIN="${VLLM_TEST_FORCE_FP8_MARLIN:-0}"
     VLLM_USE_DEEP_GEMM="${VLLM_USE_DEEP_GEMM:-1}"
+    VLLM_ENABLE_THINKING_DEFAULT="${VLLM_ENABLE_THINKING_DEFAULT:-}"
     HF_TOKEN="${HF_TOKEN:-}"
     HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
     VLLM_PORT="${VLLM_PORT:-8000}"
@@ -695,6 +696,7 @@ select_model() {
             VLLM_EXTRA_FLAGS="--no-enable-prefix-caching"
             VLLM_TEST_FORCE_FP8_MARLIN=0
             VLLM_USE_DEEP_GEMM=1
+            VLLM_ENABLE_THINKING_DEFAULT=""
             NEEDS_HF_TOKEN=true
             info "Selected: Gemma 4 26B"
             ;;
@@ -710,6 +712,11 @@ select_model() {
             VLLM_EXTRA_FLAGS="--enable-prefix-caching --reasoning-parser deepseek_r1"
             VLLM_TEST_FORCE_FP8_MARLIN=1
             VLLM_USE_DEEP_GEMM=0
+            # Serve-time default for the chat template. Setting this is what
+            # makes per-request chat_template_kwargs.enable_thinking=false
+            # actually work with --reasoning-parser deepseek_r1. Clients can
+            # still override per request in either direction.
+            VLLM_ENABLE_THINKING_DEFAULT="true"
             NEEDS_HF_TOKEN=false
             info "Selected: Qwen 3.5 35B (FP8 pre-quantized)"
             info "FP8 weights ~35GB — leaves ~61GB for KV cache at 0.75 util."
@@ -929,6 +936,7 @@ KV_CACHE_DTYPE=${KV_CACHE_DTYPE}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS}
 VLLM_TEST_FORCE_FP8_MARLIN=${VLLM_TEST_FORCE_FP8_MARLIN}
 VLLM_USE_DEEP_GEMM=${VLLM_USE_DEEP_GEMM}
+VLLM_ENABLE_THINKING_DEFAULT=${VLLM_ENABLE_THINKING_DEFAULT}
 
 # OCR
 OCR_CHUNK_SIZE=${OCR_CHUNK_SIZE}

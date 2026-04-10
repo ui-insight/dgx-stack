@@ -27,6 +27,7 @@ services:
       - GPU_MEMORY_UTIL=${GPU_MEMORY_UTIL:-0.75}
       - MAX_NUM_SEQS=${MAX_NUM_SEQS:-4}
       - VLLM_EXTRA_FLAGS=${VLLM_EXTRA_FLAGS:---no-enable-prefix-caching}
+      - VLLM_ENABLE_THINKING_DEFAULT=${VLLM_ENABLE_THINKING_DEFAULT:-}
     volumes:
       - ${HF_CACHE:-~/.cache/huggingface}:/root/.cache/huggingface
       - ./vllm-entrypoint.sh:/entrypoint.sh:ro
