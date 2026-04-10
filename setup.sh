@@ -949,7 +949,9 @@ print(json.dumps({
             echo
             fail=$((fail + 1))
         else
-            # Pull content, reasoning_content, and finish_reason in one pass.
+            # Pull content, reasoning, and finish_reason. vLLM reasoning
+            # parsers expose the thinking block under "reasoning" in newer
+            # builds and "reasoning_content" in older ones — check both.
             # Use python3 -c (not a heredoc) to avoid a bash parser edge case
             # with heredocs inside $(...) on some bash versions.
             local parsed
@@ -959,32 +961,41 @@ try:
     d = json.load(sys.stdin)
     m = d["choices"][0]["message"]
     content = (m.get("content") or "").strip()
-    reasoning = (m.get("reasoning_content") or "").strip()
+    reasoning = (m.get("reasoning") or m.get("reasoning_content") or "").strip()
     finish = d["choices"][0].get("finish_reason", "")
-    print("FINISH=" + str(finish))
-    print("CONTENT=" + content)
-    print("REASONING_LEN=" + str(len(reasoning)))
+    # Emit as a NUL-delimited stream so multi-line values survive.
+    sys.stdout.write("FINISH\x1f" + str(finish) + "\x1e")
+    sys.stdout.write("CONTENT\x1f" + content + "\x1e")
+    sys.stdout.write("REASONING\x1f" + reasoning + "\x1e")
 except Exception as e:
-    print("PARSE_ERROR=" + str(e))
+    sys.stdout.write("PARSE_ERROR\x1f" + str(e) + "\x1e")
 ' 2>/dev/null)" || parsed=""
-            chat_content="$(grep '^CONTENT=' <<< "$parsed" | sed 's/^CONTENT=//')"
-            local finish_reason reasoning_len
-            finish_reason="$(grep '^FINISH=' <<< "$parsed" | sed 's/^FINISH=//')"
-            reasoning_len="$(grep '^REASONING_LEN=' <<< "$parsed" | sed 's/^REASONING_LEN=//')"
+            # Split the parser output on the 0x1e record separator.
+            local finish_reason chat_reasoning
+            finish_reason="$(printf '%s' "$parsed" | awk -v RS=$'\x1e' -v FS=$'\x1f' '$1=="FINISH"{print $2}')"
+            chat_content="$(printf  '%s' "$parsed" | awk -v RS=$'\x1e' -v FS=$'\x1f' '$1=="CONTENT"{print $2}')"
+            chat_reasoning="$(printf '%s' "$parsed" | awk -v RS=$'\x1e' -v FS=$'\x1f' '$1=="REASONING"{print $2}')"
 
             if [[ -n "$chat_content" ]]; then
                 info "Model response (finish=${finish_reason}):"
                 echo -e "    ${DIM}${chat_content}${RESET}"
                 pass=$((pass + 1))
+            elif [[ -n "$chat_reasoning" ]]; then
+                # Content was empty but the model reasoned — treat as a pass
+                # since the endpoint clearly responded. Show a snippet so the
+                # user can see what happened.
+                local snippet
+                snippet="$(printf '%s' "$chat_reasoning" | head -c 300 | tr '\n' ' ')"
+                warn "Content field was null, but model produced reasoning output."
+                info "Reasoning (finish=${finish_reason}, ${#chat_reasoning} chars, first 300):"
+                echo -e "    ${DIM}${snippet}...${RESET}"
+                info "Endpoint is responding. To get answers in 'content', either"
+                info "drop --reasoning-parser from VLLM_EXTRA_FLAGS, or have clients"
+                info "read the 'reasoning' field in addition to 'content'."
+                pass=$((pass + 1))
             else
-                error "Chat completion returned empty content."
-                info  "  finish_reason=${finish_reason}  reasoning_content_len=${reasoning_len}"
-                if [[ "${reasoning_len:-0}" -gt 0 ]]; then
-                    warn "  Model produced reasoning tokens but no final answer."
-                    warn "  If using Qwen 3.5, the reasoning parser may be consuming all"
-                    warn "  max_tokens before emitting content. Try a higher limit or"
-                    warn "  remove --reasoning-parser from VLLM_EXTRA_FLAGS."
-                fi
+                error "Chat completion returned empty content AND empty reasoning."
+                info  "  finish_reason=${finish_reason}"
                 printf '%s' "$chat_resp" | head -c 500
                 echo
                 fail=$((fail + 1))
