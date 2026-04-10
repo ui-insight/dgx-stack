@@ -920,11 +920,10 @@ run_smoke_tests() {
         # finish thinking *and* produce a final answer, and tell the template
         # not to emit a thinking block when the model supports that hint.
         local chat_body chat_resp http_code chat_content reasoning_content
-        chat_body="$(python3 - "$served_id" <<'PY'
+        chat_body="$(python3 -c '
 import json, sys
-model = sys.argv[1]
 print(json.dumps({
-    "model": model,
+    "model": sys.argv[1],
     "messages": [
         {"role": "system", "content": "You are a concise assistant. Answer directly without showing reasoning."},
         {"role": "user",   "content": "In one sentence, what is an NVIDIA DGX Spark?"},
@@ -933,8 +932,7 @@ print(json.dumps({
     "temperature": 0.2,
     "chat_template_kwargs": {"enable_thinking": False},
 }))
-PY
-)"
+' "$served_id")"
         # Capture body + HTTP status separately so we can report failures precisely.
         local tmp_body
         tmp_body="$(mktemp)"
@@ -951,9 +949,11 @@ PY
             echo
             fail=$((fail + 1))
         else
-            # Pull content, reasoning_content, and finish_reason in one pass
+            # Pull content, reasoning_content, and finish_reason in one pass.
+            # Use python3 -c (not a heredoc) to avoid a bash parser edge case
+            # with heredocs inside $(...) on some bash versions.
             local parsed
-            parsed="$(printf '%s' "$chat_resp" | python3 - <<'PY' 2>/dev/null || true
+            parsed="$(printf '%s' "$chat_resp" | python3 -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
@@ -961,13 +961,12 @@ try:
     content = (m.get("content") or "").strip()
     reasoning = (m.get("reasoning_content") or "").strip()
     finish = d["choices"][0].get("finish_reason", "")
-    print(f"FINISH={finish}")
-    print(f"CONTENT={content}")
-    print(f"REASONING_LEN={len(reasoning)}")
+    print("FINISH=" + str(finish))
+    print("CONTENT=" + content)
+    print("REASONING_LEN=" + str(len(reasoning)))
 except Exception as e:
-    print(f"PARSE_ERROR={e}")
-PY
-)"
+    print("PARSE_ERROR=" + str(e))
+' 2>/dev/null)" || parsed=""
             chat_content="$(grep '^CONTENT=' <<< "$parsed" | sed 's/^CONTENT=//')"
             local finish_reason reasoning_len
             finish_reason="$(grep '^FINISH=' <<< "$parsed" | sed 's/^FINISH=//')"
