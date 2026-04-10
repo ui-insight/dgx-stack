@@ -626,6 +626,8 @@ load_env_values() {
     HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
     VLLM_PORT="${VLLM_PORT:-8000}"
     OCR_PORT="${OCR_PORT:-8001}"
+    DGX_NET_SUBNET="${DGX_NET_SUBNET:-10.10.99.0/24}"
+    DGX_NET_GATEWAY="${DGX_NET_GATEWAY:-10.10.99.1}"
     GPU_MEMORY_UTIL="${GPU_MEMORY_UTIL:-0.75}"
     MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
     MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
@@ -781,6 +783,23 @@ configure_interactive() {
     ask "OCR service port" "${OCR_PORT:-8001}" OCR_PORT
     echo ""
 
+    # ── Docker Network ──
+    echo -e "${BOLD}── Docker Network ──${RESET}"
+    echo "This stack's bridge network lives in the 10.10.x.x range by default"
+    echo "(to avoid the Docker default 172.16.0.0/12 pool). If the default"
+    echo "overlaps with an existing network or a host route, pick another /24."
+    ask "Docker network subnet (CIDR)" "${DGX_NET_SUBNET:-10.10.99.0/24}" DGX_NET_SUBNET
+    # Auto-derive a gateway as .1 of whatever subnet they chose, unless they
+    # already have a custom gateway in .env.
+    local auto_gateway
+    auto_gateway="$(python3 -c '
+import ipaddress, sys
+net = ipaddress.ip_network(sys.argv[1], strict=False)
+print(str(next(net.hosts())))
+' "$DGX_NET_SUBNET" 2>/dev/null || echo "")"
+    ask "Docker network gateway" "${DGX_NET_GATEWAY:-${auto_gateway:-10.10.99.1}}" DGX_NET_GATEWAY
+    echo ""
+
     # ── GPU / Memory ──
     echo -e "${BOLD}── GPU Memory ──${RESET}"
     echo "DGX Spark has 128GB unified memory shared between CPU and GPU."
@@ -899,6 +918,8 @@ HF_CACHE="${HF_CACHE}"
 # Network
 VLLM_PORT=${VLLM_PORT}
 OCR_PORT=${OCR_PORT}
+DGX_NET_SUBNET=${DGX_NET_SUBNET}
+DGX_NET_GATEWAY=${DGX_NET_GATEWAY}
 
 # GPU / Model
 GPU_MEMORY_UTIL=${GPU_MEMORY_UTIL}

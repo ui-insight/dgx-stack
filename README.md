@@ -263,9 +263,20 @@ docker compose up -d
 
 ## Networking
 
-The stack pins its Compose network explicitly to **`10.10.0.0/24`** so it
-never lands in the default `172.16.0.0/12` pool. Both containers live on
-a bridge network named `dgx-net`.
+The stack pins its Compose network explicitly to **`10.10.99.0/24`** by
+default, so it never lands in the default `172.16.0.0/12` pool. Both
+containers live on a bridge network named `dgx-net`.
+
+If `10.10.99.0/24` collides with another Docker network or a host route
+on your DGX, change it in `.env`:
+
+```
+DGX_NET_SUBNET=10.10.42.0/24
+DGX_NET_GATEWAY=10.10.42.1
+```
+
+…then `./setup.sh` → Re-Install. Setup.sh also prompts for these values
+during Fresh Install and Repair/Reconfigure.
 
 If you want every Docker network on the host (not just this stack) to
 allocate from `10.10.0.0/16`, a template daemon config ships in
