@@ -1079,17 +1079,20 @@ run_smoke_tests() {
         # finish thinking *and* produce a final answer, and tell the template
         # not to emit a thinking block when the model supports that hint.
         local chat_body chat_resp http_code chat_content reasoning_content
+        # Note: do NOT pass chat_template_kwargs.enable_thinking=false here.
+        # On Qwen 3.5 + --reasoning-parser deepseek_r1 that combination
+        # causes the parser to misclassify the final answer as reasoning
+        # and leave the content field null. Letting the model emit its
+        # normal <think> block produces a clean content/reasoning split.
         chat_body="$(python3 -c '
 import json, sys
 print(json.dumps({
     "model": sys.argv[1],
     "messages": [
-        {"role": "system", "content": "You are a concise assistant. Answer directly without showing reasoning."},
-        {"role": "user",   "content": "In one sentence, what is an NVIDIA DGX Spark?"},
+        {"role": "user", "content": "In one sentence, what is an NVIDIA DGX Spark?"},
     ],
     "max_tokens": 16384,
     "temperature": 0.2,
-    "chat_template_kwargs": {"enable_thinking": False},
 }))
 ' "$served_id")"
         # Capture body + HTTP status separately so we can report failures precisely.
