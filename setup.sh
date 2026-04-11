@@ -712,11 +712,10 @@ select_model() {
             VLLM_EXTRA_FLAGS="--enable-prefix-caching --reasoning-parser deepseek_r1"
             VLLM_TEST_FORCE_FP8_MARLIN=1
             VLLM_USE_DEEP_GEMM=0
-            # Serve-time default for the chat template. Setting this is what
-            # makes per-request chat_template_kwargs.enable_thinking=false
-            # actually work with --reasoning-parser deepseek_r1. Clients can
-            # still override per request in either direction.
-            VLLM_ENABLE_THINKING_DEFAULT="true"
+            # Leave empty by default. Set to "true" or "false" in .env to pass
+            # --default-chat-template-kwargs '{"enable_thinking":<value>}' at
+            # serve time. Empty = let the model's built-in chat template decide.
+            VLLM_ENABLE_THINKING_DEFAULT=""
             NEEDS_HF_TOKEN=false
             info "Selected: Qwen 3.5 35B (FP8 pre-quantized)"
             info "FP8 weights ~35GB — leaves ~61GB for KV cache at 0.75 util."
