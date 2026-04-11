@@ -37,5 +37,6 @@ exec python3 -m vllm.entrypoints.openai.api_server \
     --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-8192}" \
     --gpu-memory-utilization "${GPU_MEMORY_UTIL:-0.75}" \
     --max-num-seqs "${MAX_NUM_SEQS:-4}" \
+    --trust-remote-code \
     "${THINKING_FLAG[@]}" \
     ${VLLM_EXTRA_FLAGS:-}
