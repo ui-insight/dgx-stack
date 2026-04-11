@@ -42,13 +42,13 @@ docker compose up -d
 │  DGX Spark (128GB unified memory)                       │
 │                                                         │
 │  ┌──────────────────┐      ┌───────────────────────┐    │
-│  │  vLLM            │      │  OCR Service           │    │
-│  │  :8000           │◄─────│  :8001                 │    │
-│  │                  │      │                        │    │
-│  │  gemma-4-26b     │      │  /v1/ocr   (JSON)      │    │
-│  │    — or —        │      │  /v1/ocrmd (markdown)  │    │
-│  │  qwen3.5-35b     │      │                        │    │
-│  │  FP8 KV cache    │      │                        │    │
+│  │  vLLM            │      │  OCR Service          │    │
+│  │  :8000           │◄─────│  :8001                │    │
+│  │                  │      │                       │    │
+│  │  gemma-4-26b     │      │  /v1/ocr   (JSON)     │    │
+│  │    — or —        │      │  /v1/ocrmd (markdown) │    │
+│  │  qwen3.5-35b     │      │                       │    │
+│  │  FP8 KV cache    │      │                       │    │
 │  └──────────────────┘      └───────────────────────┘    │
 └─────────────────────────────────────────────────────────┘
 ```
