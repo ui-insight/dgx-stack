@@ -1235,6 +1235,10 @@ except Exception as e:
                     fail=$((fail + 1))
                 elif grep -q "END-OF-TEST-DOCUMENT" <<< "$ocr_out"; then
                     info "OCR returned ${chars} chars and contains END-OF-TEST-DOCUMENT sentinel."
+                    echo ""
+                    echo -e "${DIM}    ── OCR markdown output ─────────────────────────────────${RESET}"
+                    printf '%s\n' "$ocr_out" | sed 's/^/    /'
+                    echo -e "${DIM}    ────────────────────────────────────────────────────────${RESET}"
                     pass=$((pass + 1))
                 else
                     error "OCR response (${chars} chars) missing END-OF-TEST-DOCUMENT marker."
