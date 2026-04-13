@@ -48,11 +48,11 @@ services:
       dockerfile: Dockerfile
     container_name: ocr-service
     ports:
-      - "${OCR_PORT:-8001}:${OCR_PORT:-8001}"
+      - "${OCR_PORT:-8010}:${OCR_PORT:-8010}"
     environment:
       - VLLM_BASE_URL=http://vllm:${VLLM_PORT:-8000}
       - VLLM_MODEL=${SERVED_MODEL_NAME:-gemma-4-26b}
-      - OCR_PORT=${OCR_PORT:-8001}
+      - OCR_PORT=${OCR_PORT:-8010}
       - OCR_CHUNK_SIZE=${OCR_CHUNK_SIZE:-6}
       - OCR_OVERLAP=${OCR_OVERLAP:-2}
       - OCR_DPI=${OCR_DPI:-120}

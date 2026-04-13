@@ -29,7 +29,7 @@ from PIL import Image
 
 VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8000")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "gemma-4-26b")
-OCR_PORT = int(os.environ.get("OCR_PORT", "8001"))
+OCR_PORT = int(os.environ.get("OCR_PORT", "8010"))
 
 CHUNK_SIZE = int(os.environ.get("OCR_CHUNK_SIZE", "6"))
 OVERLAP = int(os.environ.get("OCR_OVERLAP", "2"))

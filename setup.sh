@@ -626,7 +626,7 @@ load_env_values() {
     HF_TOKEN="${HF_TOKEN:-}"
     HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
     VLLM_PORT="${VLLM_PORT:-8000}"
-    OCR_PORT="${OCR_PORT:-8001}"
+    OCR_PORT="${OCR_PORT:-8010}"
     DGX_NET_SUBNET="${DGX_NET_SUBNET:-10.10.99.0/24}"
     DGX_NET_GATEWAY="${DGX_NET_GATEWAY:-10.10.99.1}"
     GPU_MEMORY_UTIL="${GPU_MEMORY_UTIL:-0.75}"
@@ -786,7 +786,7 @@ configure_interactive() {
     # ── Ports ──
     echo -e "${BOLD}── Network Ports ──${RESET}"
     ask "vLLM API port (OpenAI-compatible)" "${VLLM_PORT:-8000}" VLLM_PORT
-    ask "OCR service port" "${OCR_PORT:-8001}" OCR_PORT
+    ask "OCR service port" "${OCR_PORT:-8010}" OCR_PORT
     echo ""
 
     # ── Docker Network ──

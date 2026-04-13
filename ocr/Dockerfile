@@ -16,9 +16,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app/ ./app/
 
-EXPOSE 8001
+EXPOSE 8010
 
-# Use sh -c so OCR_PORT is expanded at container start. Defaults to 8001
+# Use sh -c so OCR_PORT is expanded at container start. Defaults to 8010
 # if the env var is not set. docker-compose.yml passes OCR_PORT through
 # from .env and maps the same port on the host side.
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${OCR_PORT:-8001}"]
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${OCR_PORT:-8010}"]
