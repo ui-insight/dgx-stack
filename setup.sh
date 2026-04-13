@@ -636,7 +636,7 @@ load_env_values() {
     KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
     OCR_CHUNK_SIZE="${OCR_CHUNK_SIZE:-6}"
     OCR_OVERLAP="${OCR_OVERLAP:-2}"
-    OCR_DPI="${OCR_DPI:-200}"
+    OCR_DPI="${OCR_DPI:-120}"
     OCR_MAX_TOKENS="${OCR_MAX_TOKENS:-16384}"
     OCR_MAX_CONCURRENT_CHUNKS="${OCR_MAX_CONCURRENT_CHUNKS:-4}"
     OCR_MAX_PAGES="${OCR_MAX_PAGES:-200}"
@@ -669,15 +669,15 @@ select_model() {
     echo ""
     echo "  Both models serve as LLM and OCR (multimodal vision)."
     echo ""
-    echo -e "  ${BOLD}1)${RESET} Gemma 4 26B  ${DIM}(google/gemma-4-26B-A4B-it)${RESET}"
-    echo "     MoE 26B total / 4B active, BF16 ~52GB weights"
-    echo "     128K context, strong general LLM"
-    echo "     Requires HuggingFace token + license acceptance"
-    echo ""
-    echo -e "  ${BOLD}2)${RESET} Qwen 3.5 35B FP8 ${DIM}(Qwen/Qwen3.5-35B-A3B-FP8)${RESET}"
+    echo -e "  ${BOLD}1)${RESET} Qwen 3.5 35B FP8 ${DIM}(Qwen/Qwen3.5-35B-A3B-FP8)${RESET}"
     echo "     MoE 35B total / 3B active, FP8 ~35GB weights"
     echo "     262K context, excellent OCR and table handling"
     echo "     Open access, no token required"
+    echo ""
+    echo -e "  ${BOLD}2)${RESET} Gemma 4 26B  ${DIM}(google/gemma-4-26B-A4B-it)${RESET}"
+    echo "     MoE 26B total / 4B active, BF16 ~52GB weights"
+    echo "     128K context, strong general LLM"
+    echo "     Requires HuggingFace token + license acceptance"
     echo ""
 
     local choice
@@ -685,22 +685,6 @@ select_model() {
 
     case "$choice" in
         1)
-            MODEL_CHOICE="gemma4"
-            VLLM_IMAGE="vllm/vllm-openai:gemma4-cu130"
-            HF_MODEL_ID="google/gemma-4-26B-A4B-it"
-            SERVED_MODEL_NAME="gemma-4-26b"
-            DEFAULT_MAX_MODEL_LEN="131072"
-            DEFAULT_MAX_NUM_BATCHED_TOKENS="8192"
-            DEFAULT_GPU_MEMORY_UTIL="0.75"
-            DEFAULT_KV_CACHE_DTYPE="fp8"
-            VLLM_EXTRA_FLAGS="--no-enable-prefix-caching"
-            VLLM_TEST_FORCE_FP8_MARLIN=0
-            VLLM_USE_DEEP_GEMM=1
-            VLLM_ENABLE_THINKING_DEFAULT=""
-            NEEDS_HF_TOKEN=true
-            info "Selected: Gemma 4 26B"
-            ;;
-        2)
             MODEL_CHOICE="qwen35"
             VLLM_IMAGE="vllm/vllm-openai:cu130-nightly"
             HF_MODEL_ID="Qwen/Qwen3.5-35B-A3B-FP8"
@@ -719,6 +703,22 @@ select_model() {
             NEEDS_HF_TOKEN=false
             info "Selected: Qwen 3.5 35B (FP8 pre-quantized)"
             info "FP8 weights ~35GB — leaves ~61GB for KV cache at 0.75 util."
+            ;;
+        2)
+            MODEL_CHOICE="gemma4"
+            VLLM_IMAGE="vllm/vllm-openai:gemma4-cu130"
+            HF_MODEL_ID="google/gemma-4-26B-A4B-it"
+            SERVED_MODEL_NAME="gemma-4-26b"
+            DEFAULT_MAX_MODEL_LEN="131072"
+            DEFAULT_MAX_NUM_BATCHED_TOKENS="8192"
+            DEFAULT_GPU_MEMORY_UTIL="0.75"
+            DEFAULT_KV_CACHE_DTYPE="fp8"
+            VLLM_EXTRA_FLAGS="--no-enable-prefix-caching"
+            VLLM_TEST_FORCE_FP8_MARLIN=0
+            VLLM_USE_DEEP_GEMM=1
+            VLLM_ENABLE_THINKING_DEFAULT=""
+            NEEDS_HF_TOKEN=true
+            info "Selected: Gemma 4 26B"
             ;;
         *)
             error "Invalid choice. Please enter 1 or 2."
@@ -858,7 +858,7 @@ print(str(next(net.hosts())))
     echo -e "${DIM}These control how documents are split and processed.${RESET}"
     ask "Pages per chunk" "${OCR_CHUNK_SIZE:-6}" OCR_CHUNK_SIZE
     ask "Overlap pages between chunks" "${OCR_OVERLAP:-2}" OCR_OVERLAP
-    ask "PDF rendering DPI" "${OCR_DPI:-200}" OCR_DPI
+    ask "PDF rendering DPI" "${OCR_DPI:-120}" OCR_DPI
     ask "Max tokens per LLM response" "${OCR_MAX_TOKENS:-16384}" OCR_MAX_TOKENS
     ask "Max concurrent chunks" "${OCR_MAX_CONCURRENT_CHUNKS:-4}" OCR_MAX_CONCURRENT_CHUNKS
     ask "Max pages per document" "${OCR_MAX_PAGES:-200}" OCR_MAX_PAGES
