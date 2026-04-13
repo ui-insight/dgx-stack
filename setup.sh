@@ -709,12 +709,12 @@ select_model() {
             DEFAULT_MAX_NUM_BATCHED_TOKENS="8192"
             DEFAULT_GPU_MEMORY_UTIL="0.75"
             DEFAULT_KV_CACHE_DTYPE="fp8"
-            VLLM_EXTRA_FLAGS="--enable-prefix-caching --reasoning-parser deepseek_r1"
+            VLLM_EXTRA_FLAGS="--enable-prefix-caching --reasoning-parser qwen3"
             VLLM_TEST_FORCE_FP8_MARLIN=1
             VLLM_USE_DEEP_GEMM=0
             # Serve-time default for the chat template. Setting this is what
             # makes per-request chat_template_kwargs.enable_thinking=false
-            # overrides actually take effect with --reasoning-parser deepseek_r1.
+            # overrides actually take effect with --reasoning-parser qwen3.
             VLLM_ENABLE_THINKING_DEFAULT="true"
             NEEDS_HF_TOKEN=false
             info "Selected: Qwen 3.5 35B (FP8 pre-quantized)"
@@ -1081,13 +1081,13 @@ run_smoke_tests() {
     echo ""
     step "Test 2/3 — POST ${chat_url}/v1/chat/completions"
     if [[ -n "${served_id:-}" ]]; then
-        # Reasoning models (Qwen 3.5 with --reasoning-parser deepseek_r1) split
+        # Reasoning models (Qwen 3.5 with --reasoning-parser qwen3) split
         # output into reasoning_content + content. Ask for enough tokens to
         # finish thinking *and* produce a final answer, and tell the template
         # not to emit a thinking block when the model supports that hint.
         local chat_body chat_resp http_code chat_content reasoning_content
         # Note: do NOT pass chat_template_kwargs.enable_thinking=false here.
-        # On Qwen 3.5 + --reasoning-parser deepseek_r1 that combination
+        # On Qwen 3.5 + --reasoning-parser qwen3 that combination
         # causes the parser to misclassify the final answer as reasoning
         # For reasoning models we disable thinking so the request returns
         # fast without burning tokens on a <think> block. This relies on

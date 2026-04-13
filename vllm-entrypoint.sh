@@ -17,7 +17,7 @@ echo "=========================="
 
 # Build an optional --default-chat-template-kwargs flag for models that
 # support toggling thinking per-request (e.g. Qwen 3.5 with
-# --reasoning-parser deepseek_r1). Setting the serve-time default is what
+# --reasoning-parser qwen3). Setting the serve-time default is what
 # makes the per-request enable_thinking=false override actually work.
 # Using a bash array preserves the embedded JSON as a single argv entry
 # regardless of the quoting in VLLM_EXTRA_FLAGS.
