@@ -22,8 +22,8 @@ banner() {
     clear 2>/dev/null || true
     echo ""
     echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════╗${RESET}"
-    echo -e "${CYAN}${BOLD}║           DGX Spark Stack Setup                         ║${RESET}"
-    echo -e "${CYAN}${BOLD}║           vLLM + OCR Service                            ║${RESET}"
+    echo -e "${CYAN}${BOLD}║           DGX Spark Stack Setup                          ║${RESET}"
+    echo -e "${CYAN}${BOLD}║           vLLM + OCR Service                             ║${RESET}"
     echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════════════╝${RESET}"
     echo ""
 }
@@ -1023,7 +1023,7 @@ deploy_start_and_wait() {
 
     echo ""
     echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════════════╗${RESET}"
-    echo -e "${GREEN}${BOLD}║  Stack is running!                                      ║${RESET}"
+    echo -e "${GREEN}${BOLD}║  Stack is running!                                       ║${RESET}"
     echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════════════════════╝${RESET}"
     echo ""
     echo "  Model: ${SERVED_MODEL_NAME}"
