@@ -1,6 +1,10 @@
 # DGX Stack
 
-Two-container stack for running a multimodal LLM on an **NVIDIA DGX Spark** (ARM Grace CPU + Blackwell GPU, 128GB unified memory). One container serves the model via vLLM, the other provides document OCR using the same model's vision capabilities.
+<img width="1714" height="624" alt="Gemini_Generated_Image_y4377ry4377ry437" src="https://github.com/user-attachments/assets/6d127295-b5b4-4201-a8f3-d5efd41d24ae" />
+  
+&nbsp;
+
+Ultra-convenient two-container stack for running a multimodal LLM on an **NVIDIA DGX Spark** (ARM Grace CPU + Blackwell GPU, 128GB unified memory). One container serves the model via vLLM, the other provides document OCR using the same model's vision capabilities.
 
 ## Supported Models
 
