@@ -975,6 +975,10 @@ deploy() {
 
 deploy_start_and_wait() {
     step "Starting services..."
+    echo ""
+    echo -e "  ${YELLOW}${BOLD}NOTE: Loading the model into GPU memory can take 5+ minutes.${RESET}"
+    echo -e "  ${YELLOW}${BOLD}      Please be patient — the health check will wait.${RESET}"
+    echo ""
     docker compose up -d
 
     echo ""
