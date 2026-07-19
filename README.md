@@ -328,6 +328,36 @@ allocates from `10.10.0.0/16` in `/24` slices. Nothing lands on `172.x.x.x`.
 - **Warmup** — The first request to each instance after startup takes up to ~60s due to torch.compile/CUDA graph warmup. Subsequent requests are fast.
 - **fastsafetensors** — If the LLM fails at startup with a load-format error (e.g. a custom image without the `fastsafetensors` package), remove `--load-format fastsafetensors` from `VLLM_EXTRA_FLAGS`.
 
+## Optional: MindRouter Gateway
+
+[MindRouter](https://github.com/ui-insight/mindrouter) is an LLM gateway /
+load balancer (OpenAI-compatible API, per-user API keys, quotas, fair-share
+scheduling, dashboards, audit logging). The stack can optionally install it
+locally on the DGX, registering the machine as a MindRouter **node** (with
+the GPU telemetry sidecar) and both vLLM instances as **backends**:
+
+```bash
+./setup.sh                     # → option 8, or say yes when offered after a deploy
+# or directly:
+./mindrouter/install-mindrouter.sh
+```
+
+The installer is idempotent and non-interactive: it clones MindRouter to
+`~/mindrouter`, moves it off the colliding default ports (gateway on
+**8080** — ports 8000/8001 belong to the vLLM instances), generates all
+secrets, runs migrations, seeds the admin account, captures the one-time
+admin API key to `~/mindrouter/.admin_api_key`, registers the node + both
+backends, applies the model/OCR configuration MindRouter needs for these
+specific backends, and smoke-tests a routed chat and OCR request. After
+install, clients use `http://<dgx>:8080/v1` with MindRouter API keys — the
+direct ports keep working unchanged.
+
+**Change the seeded dashboard password (admin/admin123) immediately.**
+
+Full documentation — installer configuration, ports, creating user API
+keys, operations, recovery, and uninstall — is in
+[`mindrouter/README.md`](mindrouter/README.md).
+
 ## NSF Acknowledgement
 
 <img src="https://github.com/user-attachments/assets/d2b43c22-84f6-4912-91dc-8b081d9e2c6f" alt="NSF Logo" width="157">

@@ -213,6 +213,7 @@ main_menu() {
     echo -e "  ${BOLD}5)${RESET} Turn Off          ${DIM}— stop all containers${RESET}"
     echo -e "  ${BOLD}6)${RESET} View Logs         ${DIM}— tail container logs${RESET}"
     echo -e "  ${BOLD}7)${RESET} Configure Networks ${DIM}— install /etc/docker/daemon.json to use 10.10.x.x${RESET}"
+    echo -e "  ${BOLD}8)${RESET} Install MindRouter ${DIM}— optional API gateway/load balancer fronting this stack${RESET}"
     echo -e "  ${BOLD}q)${RESET} Quit"
     echo ""
 
@@ -228,6 +229,7 @@ main_menu() {
         5) action_turn_off ;;
         6) action_view_logs ;;
         7) action_configure_networks ;;
+        8) action_install_mindrouter ;;
         q|Q) echo "Goodbye."; exit 0 ;;
         *)
             error "Invalid choice."
@@ -568,6 +570,53 @@ sys.stdout.write(json.dumps(existing, indent=2) + "\n")
     echo ""
 
     confirm "Return to menu?" "y" && main_menu || true
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Action: Install MindRouter (optional)
+# Installs github.com/ui-insight/mindrouter locally, registers this DGX as
+# a node and both vLLM instances as backends. Details and idempotency live
+# in mindrouter/install-mindrouter.sh.
+# ───────────────────────────────────────────────────────────────────────────
+
+action_install_mindrouter() {
+    # $1 == "auto": invoked from the post-deploy opt-in, where the user has
+    # already said yes — skip the inner confirmation and the menu return.
+    local mode="${1:-menu}"
+    echo ""
+    step "Install MindRouter"
+    echo ""
+    echo "MindRouter is an LLM gateway/load balancer (github.com/ui-insight/mindrouter)"
+    echo "with an OpenAI-compatible API, per-user API keys, quotas, fair-share"
+    echo "scheduling, dashboards, and audit logging. This will:"
+    echo ""
+    echo "  • Clone and build MindRouter locally (first build takes a while)"
+    echo "  • Run it on port 8080 (gateway) alongside this stack"
+    echo "  • Register this DGX as a node (with GPU telemetry sidecar)"
+    echo "  • Register both vLLM instances as backends"
+    echo "  • Smoke-test a routed chat and OCR request"
+    echo ""
+
+    if [[ "$mode" != "auto" ]]; then
+        echo "Requires the dgx-stack to be deployed and healthy first."
+        echo ""
+        if ! confirm "Install MindRouter now?" "n"; then
+            echo ""
+            main_menu || true
+            return
+        fi
+    fi
+
+    if bash "${SCRIPT_DIR}/mindrouter/install-mindrouter.sh"; then
+        info "MindRouter installation finished."
+    else
+        error "MindRouter installation failed — see output above."
+        error "Re-running is safe: the installer is idempotent."
+    fi
+    echo ""
+    if [[ "$mode" != "auto" ]]; then
+        confirm "Return to menu?" "y" && main_menu || true
+    fi
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1099,6 +1148,11 @@ deploy_start_and_wait() {
     echo "  Quick test:"
     echo "    curl -X POST http://localhost:${OCR_PORT}/v1/ocrmd -F file=@document.pdf"
     echo ""
+
+    # Optional add-on: MindRouter gateway fronting the freshly deployed stack.
+    if confirm "Also install MindRouter (optional API gateway/load balancer)?" "n"; then
+        action_install_mindrouter auto
+    fi
 }
 
 # ───────────────────────────────────────────────────────────────────────────
