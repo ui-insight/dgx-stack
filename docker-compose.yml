@@ -19,14 +19,14 @@ services:
       - HF_MODEL_ID=${HF_MODEL_ID:-nvidia/Qwen3.6-35B-A3B-NVFP4}
       - SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-qwen3.6-35b}
       - VLLM_PORT=${VLLM_PORT:-8000}
-      - KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-fp8}
+      - KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-auto}
       - MAX_MODEL_LEN=${MAX_MODEL_LEN:-262144}
       - MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-8192}
       - GPU_MEMORY_UTIL=${GPU_MEMORY_UTIL:-0.4}
-      - MAX_NUM_SEQS=${MAX_NUM_SEQS:-4}
+      - MAX_NUM_SEQS=${MAX_NUM_SEQS:-12}
       - VLLM_EXTRA_FLAGS=${VLLM_EXTRA_FLAGS:---no-enable-prefix-caching --reasoning-parser qwen3 --tool-call-parser qwen3_xml --enable-auto-tool-choice --attention-backend flashinfer --moe-backend marlin --enable-chunked-prefill --async-scheduling --load-format fastsafetensors}
       - VLLM_SPECULATIVE_TOKENS=${VLLM_SPECULATIVE_TOKENS:-3}
-      - VLLM_ENABLE_THINKING_DEFAULT=${VLLM_ENABLE_THINKING_DEFAULT:-true}
+      - VLLM_ENABLE_THINKING_DEFAULT=${VLLM_ENABLE_THINKING_DEFAULT:-false}
     volumes:
       - ${HF_CACHE:-~/.cache/huggingface}:/root/.cache/huggingface
       - ./vllm-entrypoint.sh:/entrypoint.sh:ro
@@ -43,8 +43,9 @@ services:
 
   # Dedicated OCR model: dots.mocr (~3B VLM specialized for document
   # parsing) served as a second vLLM instance alongside the main LLM.
-  # Both share the DGX Spark's 128GB unified memory: qwen at 0.4
-  # (~51GB) + mocr at 0.10 (~13GB) leaves ~64GB for OS + OCR service.
+  # Both share the DGX Spark's 128GB unified memory: qwen ~60GB
+  # (weights + KV) + mocr ~13GB (weights + fixed 8GB KV) leaves
+  # ~50GB for OS + OCR service.
   mocr:
     image: ${VLLM_IMAGE:-vllm/vllm-openai:vllm-arm64-cu13-0.25.1-7a33ba9}
     container_name: mocr-server
@@ -69,8 +70,8 @@ services:
       - MAX_MODEL_LEN=${MOCR_MAX_MODEL_LEN:-32768}
       - MAX_NUM_BATCHED_TOKENS=${MOCR_MAX_NUM_BATCHED_TOKENS:-16384}
       - GPU_MEMORY_UTIL=${MOCR_GPU_MEMORY_UTIL:-0.10}
-      - MAX_NUM_SEQS=${MOCR_MAX_NUM_SEQS:-4}
-      - VLLM_EXTRA_FLAGS=${MOCR_VLLM_EXTRA_FLAGS:---enable-prefix-caching --enable-chunked-prefill --chat-template-content-format string --kv-cache-memory-bytes 4294967296}
+      - MAX_NUM_SEQS=${MOCR_MAX_NUM_SEQS:-12}
+      - VLLM_EXTRA_FLAGS=${MOCR_VLLM_EXTRA_FLAGS:---enable-prefix-caching --enable-chunked-prefill --chat-template-content-format string --kv-cache-memory-bytes 8589934592}
       - VLLM_LIMIT_MM_PER_PROMPT={"image":1}
       - VLLM_SPECULATIVE_TOKENS=0
       - VLLM_ENABLE_THINKING_DEFAULT=
@@ -103,7 +104,7 @@ services:
       - OCR_MAX_TOKENS=${OCR_MAX_TOKENS:-16384}
       - OCR_TEMPERATURE=${OCR_TEMPERATURE:-0.1}
       - OCR_TOP_P=${OCR_TOP_P:-0.9}
-      - OCR_MAX_CONCURRENT_PAGES=${OCR_MAX_CONCURRENT_PAGES:-4}
+      - OCR_MAX_CONCURRENT_PAGES=${OCR_MAX_CONCURRENT_PAGES:-12}
       - OCR_MAX_RETRIES=${OCR_MAX_RETRIES:-2}
       - OCR_MAX_PAGES=${OCR_MAX_PAGES:-200}
       - OCR_MAX_FILE_SIZE_MB=${OCR_MAX_FILE_SIZE_MB:-100}

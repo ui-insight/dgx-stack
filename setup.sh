@@ -33,10 +33,10 @@ DEFAULT_SERVED_MODEL_NAME="qwen3.6-35b"
 DEFAULT_VLLM_EXTRA_FLAGS="--no-enable-prefix-caching --reasoning-parser qwen3 --tool-call-parser qwen3_xml --enable-auto-tool-choice --attention-backend flashinfer --moe-backend marlin --enable-chunked-prefill --async-scheduling --load-format fastsafetensors"
 DEFAULT_MOCR_MODEL_ID="binedge/dots.mocr-FP8"
 DEFAULT_MOCR_SERVED_MODEL_NAME="dots-mocr"
-# kv-cache-memory-bytes: fixed 4GB KV for the OCR instance — on unified
+# kv-cache-memory-bytes: fixed 8GB KV for the OCR instance — on unified
 # memory a fractional gpu-memory-utilization budget is consumed by the
 # LLM instance's allocation before this instance starts.
-DEFAULT_MOCR_VLLM_EXTRA_FLAGS="--enable-prefix-caching --enable-chunked-prefill --chat-template-content-format string --kv-cache-memory-bytes 4294967296"
+DEFAULT_MOCR_VLLM_EXTRA_FLAGS="--enable-prefix-caching --enable-chunked-prefill --chat-template-content-format string --kv-cache-memory-bytes 8589934592"
 
 banner() {
     clear 2>/dev/null || true
@@ -680,7 +680,7 @@ load_env_values() {
     SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-$DEFAULT_SERVED_MODEL_NAME}"
     VLLM_EXTRA_FLAGS="${VLLM_EXTRA_FLAGS:-$DEFAULT_VLLM_EXTRA_FLAGS}"
     VLLM_SPECULATIVE_TOKENS="${VLLM_SPECULATIVE_TOKENS:-3}"
-    VLLM_ENABLE_THINKING_DEFAULT="${VLLM_ENABLE_THINKING_DEFAULT:-true}"
+    VLLM_ENABLE_THINKING_DEFAULT="${VLLM_ENABLE_THINKING_DEFAULT:-false}"
     HF_TOKEN="${HF_TOKEN:-}"
     HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
     VLLM_PORT="${VLLM_PORT:-8000}"
@@ -689,23 +689,23 @@ load_env_values() {
     DGX_NET_GATEWAY="${DGX_NET_GATEWAY:-10.10.99.1}"
     GPU_MEMORY_UTIL="${GPU_MEMORY_UTIL:-0.4}"
     MAX_MODEL_LEN="${MAX_MODEL_LEN:-262144}"
-    MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
+    MAX_NUM_SEQS="${MAX_NUM_SEQS:-12}"
     MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
-    KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
+    KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-auto}"
     MOCR_MODEL_ID="${MOCR_MODEL_ID:-$DEFAULT_MOCR_MODEL_ID}"
     MOCR_SERVED_MODEL_NAME="${MOCR_SERVED_MODEL_NAME:-$DEFAULT_MOCR_SERVED_MODEL_NAME}"
     MOCR_VLLM_EXTRA_FLAGS="${MOCR_VLLM_EXTRA_FLAGS:-$DEFAULT_MOCR_VLLM_EXTRA_FLAGS}"
     MOCR_PORT="${MOCR_PORT:-8001}"
     MOCR_GPU_MEMORY_UTIL="${MOCR_GPU_MEMORY_UTIL:-0.10}"
     MOCR_MAX_MODEL_LEN="${MOCR_MAX_MODEL_LEN:-32768}"
-    MOCR_MAX_NUM_SEQS="${MOCR_MAX_NUM_SEQS:-4}"
+    MOCR_MAX_NUM_SEQS="${MOCR_MAX_NUM_SEQS:-12}"
     MOCR_MAX_NUM_BATCHED_TOKENS="${MOCR_MAX_NUM_BATCHED_TOKENS:-16384}"
     MOCR_KV_CACHE_DTYPE="${MOCR_KV_CACHE_DTYPE:-auto}"
     OCR_DPI="${OCR_DPI:-200}"
     OCR_MAX_TOKENS="${OCR_MAX_TOKENS:-16384}"
     OCR_TEMPERATURE="${OCR_TEMPERATURE:-0.1}"
     OCR_TOP_P="${OCR_TOP_P:-0.9}"
-    OCR_MAX_CONCURRENT_PAGES="${OCR_MAX_CONCURRENT_PAGES:-4}"
+    OCR_MAX_CONCURRENT_PAGES="${OCR_MAX_CONCURRENT_PAGES:-12}"
     OCR_MAX_RETRIES="${OCR_MAX_RETRIES:-2}"
     OCR_MAX_PAGES="${OCR_MAX_PAGES:-200}"
     OCR_MAX_FILE_SIZE_MB="${OCR_MAX_FILE_SIZE_MB:-100}"
@@ -723,7 +723,7 @@ load_env_values() {
             HF_MODEL_ID="$DEFAULT_HF_MODEL_ID"
             SERVED_MODEL_NAME="$DEFAULT_SERVED_MODEL_NAME"
             VLLM_EXTRA_FLAGS="$DEFAULT_VLLM_EXTRA_FLAGS"
-            VLLM_ENABLE_THINKING_DEFAULT="true"
+            VLLM_ENABLE_THINKING_DEFAULT="false"
             VLLM_SPECULATIVE_TOKENS=3
             MAX_MODEL_LEN=262144
             GPU_MEMORY_UTIL=0.4
@@ -755,10 +755,11 @@ set_model_defaults() {
     SERVED_MODEL_NAME="$DEFAULT_SERVED_MODEL_NAME"
     VLLM_EXTRA_FLAGS="$DEFAULT_VLLM_EXTRA_FLAGS"
     VLLM_SPECULATIVE_TOKENS="${VLLM_SPECULATIVE_TOKENS:-3}"
-    # Serve-time default for the chat template. Setting this is what
-    # makes per-request chat_template_kwargs.enable_thinking=false
-    # overrides actually take effect with --reasoning-parser qwen3.
-    VLLM_ENABLE_THINKING_DEFAULT="true"
+    # Serve-time default for the chat template: thinking OFF unless a
+    # request opts in with chat_template_kwargs.enable_thinking=true.
+    # Setting an explicit default is what makes per-request overrides
+    # take effect with --reasoning-parser qwen3.
+    VLLM_ENABLE_THINKING_DEFAULT="false"
 
     MOCR_MODEL_ID="$DEFAULT_MOCR_MODEL_ID"
     MOCR_SERVED_MODEL_NAME="$DEFAULT_MOCR_SERVED_MODEL_NAME"
@@ -768,7 +769,7 @@ set_model_defaults() {
     # on Fresh Install (no .env, load_env_values never runs) write_env
     # would otherwise hit unbound variables under set -u.
     MOCR_MAX_MODEL_LEN="${MOCR_MAX_MODEL_LEN:-32768}"
-    MOCR_MAX_NUM_SEQS="${MOCR_MAX_NUM_SEQS:-4}"
+    MOCR_MAX_NUM_SEQS="${MOCR_MAX_NUM_SEQS:-12}"
     MOCR_MAX_NUM_BATCHED_TOKENS="${MOCR_MAX_NUM_BATCHED_TOKENS:-16384}"
     MOCR_KV_CACHE_DTYPE="${MOCR_KV_CACHE_DTYPE:-auto}"
     OCR_TEMPERATURE="${OCR_TEMPERATURE:-0.1}"
@@ -863,18 +864,18 @@ print(str(next(net.hosts())))
     # ── Model Config ──
     echo -e "${BOLD}── Model Configuration ──${RESET}"
     ask "Max context length (tokens)" "${MAX_MODEL_LEN:-262144}" MAX_MODEL_LEN
-    ask "Max concurrent sequences" "${MAX_NUM_SEQS:-4}" MAX_NUM_SEQS
+    ask "Max concurrent sequences" "${MAX_NUM_SEQS:-12}" MAX_NUM_SEQS
     ask "Max batched tokens (required ≥ Mamba block size for Qwen)" "${MAX_NUM_BATCHED_TOKENS:-8192}" MAX_NUM_BATCHED_TOKENS
     ask "Speculative decode tokens (MTP draft length, 0 = off)" "${VLLM_SPECULATIVE_TOKENS:-3}" VLLM_SPECULATIVE_TOKENS
     echo ""
 
     # ── KV Cache ──
     echo -e "${BOLD}── KV Cache ──${RESET}"
-    echo "FP8 KV cache (Qwen instance) saves memory but may cause FlashInfer"
-    echo "errors on some builds. Use 'auto' (BF16) as a fallback if you see"
-    echo "CUDA stream capture errors. The dots.mocr instance always uses auto."
+    echo "auto (BF16) is the stable default. fp8 doubles KV capacity but has"
+    echo "caused intermittent CUDA illegal-memory crashes under mixed load on"
+    echo "SM12.1. The dots.mocr instance always uses auto."
     echo ""
-    ask "Qwen KV cache dtype (fp8 or auto)" "${KV_CACHE_DTYPE:-fp8}" KV_CACHE_DTYPE
+    ask "Qwen KV cache dtype (auto or fp8)" "${KV_CACHE_DTYPE:-auto}" KV_CACHE_DTYPE
     echo ""
 
     # ── HuggingFace Cache ──
@@ -889,7 +890,7 @@ print(str(next(net.hosts())))
     echo -e "${DIM}dots.mocr processes one page per request; pages run in parallel.${RESET}"
     ask "PDF rendering DPI (200 recommended by dots.mocr)" "${OCR_DPI:-200}" OCR_DPI
     ask "Max tokens per page response" "${OCR_MAX_TOKENS:-16384}" OCR_MAX_TOKENS
-    ask "Max concurrent pages" "${OCR_MAX_CONCURRENT_PAGES:-4}" OCR_MAX_CONCURRENT_PAGES
+    ask "Max concurrent pages" "${OCR_MAX_CONCURRENT_PAGES:-12}" OCR_MAX_CONCURRENT_PAGES
     ask "Max pages per document" "${OCR_MAX_PAGES:-200}" OCR_MAX_PAGES
     ask "Max upload file size (MB)" "${OCR_MAX_FILE_SIZE_MB:-100}" OCR_MAX_FILE_SIZE_MB
     echo ""

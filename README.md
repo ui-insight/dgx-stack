@@ -17,7 +17,7 @@ Three-container stack for running a chat LLM **and** a dedicated document-OCR mo
 
 The Qwen NVFP4 checkpoint also keeps its vision tower unquantized, and NVIDIA's published evals show essentially no accuracy loss vs BF16 (MMLU Pro 85.6 → 85.0, GPQA Diamond 84.9 → 84.8, MMMU Pro 74.1 → 74.5).
 
-vLLM is pinned to **0.25.1** (`vllm/vllm-openai:vllm-arm64-cu13-0.25.1-7a33ba9` — the v0.25.1 release branch built for ARM64 + CUDA 13; the upstream image, not the NGC container, is what both vLLM's DGX Spark guide and NVIDIA's model card recommend). The LLM instance follows NVIDIA's recommended Spark configuration: FlashInfer attention, Marlin NVFP4 MoE kernels, FP8 KV cache, chunked prefill, async scheduling, fastsafetensors loading, and **MTP speculative decoding** (the model's multi-token-prediction head drafts 3 tokens per step; the base model verifies every draft, so the output distribution matches non-speculative decoding — measured ~76.7 → ~108 tok/s on a Spark). Prefix caching is deliberately **disabled** on the LLM instance: combined with MTP it corrupts this hybrid-attention model's recurrent state (vLLM issue #43559, fix not yet in 0.25.1).
+vLLM is pinned to **0.25.1** (`vllm/vllm-openai:vllm-arm64-cu13-0.25.1-7a33ba9` — the v0.25.1 release branch built for ARM64 + CUDA 13; the upstream image, not the NGC container, is what both vLLM's DGX Spark guide and NVIDIA's model card recommend). The LLM instance follows NVIDIA's recommended Spark configuration: FlashInfer attention, Marlin NVFP4 MoE kernels, BF16 KV cache, chunked prefill, async scheduling, fastsafetensors loading, and **MTP speculative decoding** (the model's multi-token-prediction head drafts 3 tokens per step; the base model verifies every draft, so the output distribution matches non-speculative decoding — measured ~76.7 → ~108 tok/s on a Spark). Prefix caching is deliberately **disabled** on the LLM instance: combined with MTP it corrupts this hybrid-attention model's recurrent state (vLLM issue #43559, fix not yet in 0.25.1).
 
 ## Prerequisites
 
@@ -55,17 +55,17 @@ docker compose up -d
 │  │  :8000           │  │  :8001           │◄─│  :8010           │  │
 │  │                  │  │                  │  │                  │  │
 │  │  qwen3.6-35b     │  │  dots-mocr       │  │  /v1/ocr (JSON)  │  │
-│  │  NVFP4, ~51GB    │  │  FP8, ~13GB      │  │  /v1/ocrmd (md)  │  │
+│  │  NVFP4, ~51GB    │  │  FP8, 8GB KV     │  │  /v1/ocrmd (md)  │  │
 │  │  MTP spec decode │  │  layout parsing  │  │                  │  │
 │  └──────────────────┘  └──────────────────┘  └──────────────────┘  │
-│        gpu-util 0.4         gpu-util 0.10      (~64GB left for OS) │
+│        gpu-util 0.4         fixed 8GB KV       (~50GB left for OS) │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
 ### OCR Pipeline
 
 1. **Convert** — PDF pages (via poppler, 200 DPI), images, or Office docs (via LibreOffice) are converted to PNG images
-2. **Parse** — Each page is sent to dots.mocr individually (it is a single-page model), up to 4 pages in parallel; the model returns layout JSON: every element's bounding box, category, and text (tables as HTML, formulas as LaTeX, prose as markdown), in reading order
+2. **Parse** — Each page is sent to dots.mocr individually (it is a single-page model), up to 12 pages in parallel; the model returns layout JSON: every element's bounding box, category, and text (tables as HTML, formulas as LaTeX, prose as markdown), in reading order
 3. **Render** — The layout JSON is rendered to markdown the same way the upstream dots.mocr pipeline does: page headers/footers dropped, formulas wrapped in `$$` blocks, tables kept as HTML
 4. **Retry** — Pages whose layout JSON fails to parse are retried, then fall back to plain-text extraction
 5. **Join** — Page markdown is concatenated in order (pages are disjoint, so no overlap stitching is needed)
@@ -142,7 +142,7 @@ curl -X POST http://localhost:8010/v1/ocrmd -F file=@document.pdf
 
 ## Tests
 
-Two layers of testing ship with the stack:
+Three layers of testing ship with the stack:
 
 **Unit tests** (no GPU or running stack needed) cover the dots.mocr layout-JSON → markdown formatter:
 
@@ -151,6 +151,14 @@ python3 -m unittest discover -s ocr/tests -v
 ```
 
 **End-to-end smoke tests** run automatically after deploy (or any time via `./setup.sh` → Test). Six checks: both vLLM instances' `/v1/models`, an LLM chat completion, a direct dots.mocr page-OCR through the exact service code path, the `/v1/ocr` JSON endpoint with **table-fidelity assertions** (all 6 column headers and key cell values of the test table must survive — this catches the known merged-table-column failure mode), and the `/v1/ocrmd` sentinel check — followed by a unified-memory usage report.
+
+**Load & correctness benchmark** (`bench/loadtest.py`, stdlib-only — runs on the DGX host or any client) exercises the full feature surface under diverse concurrent load: thinking on/off with reasoning-parser verification, tool calling with a simulated tool round-trip, max_tokens enforcement, a streaming LLM throughput sweep (aggregate + per-stream tok/s, TTFT mean/p95) across configurable concurrency, real downloaded arXiv PDFs through the OCR service (single-doc latency + concurrent pages/min), and a mixed chat/thinking/tools/OCR batch. Results print as a table and are written to a timestamped JSON for run-over-run comparison:
+
+```bash
+python3 bench/loadtest.py            # full run (~10-20 min)
+python3 bench/loadtest.py --quick    # reduced run (~3 min)
+python3 bench/loadtest.py --concurrency 1,4,8,12 --skip-ocr
+```
 
 A small 3-page test PDF lives at [`examples/test-doc.pdf`](examples/test-doc.pdf) so you can also verify endpoints manually right after `docker compose up -d`:
 
@@ -216,11 +224,11 @@ All settings live in `.env` (generated by `setup.sh`). Key options:
 | `SERVED_MODEL_NAME` | `qwen3.6-35b` | LLM name exposed in the API |
 | `VLLM_EXTRA_FLAGS` | see `.env.example` | LLM performance flags (FlashInfer, Marlin MoE, …; prefix caching intentionally off) |
 | `VLLM_SPECULATIVE_TOKENS` | 3 | MTP speculative decode draft length (0 = off) |
-| `VLLM_ENABLE_THINKING_DEFAULT` | true | Serve-time default for the Qwen thinking toggle |
+| `VLLM_ENABLE_THINKING_DEFAULT` | false | Thinking off by default; requests opt in via `chat_template_kwargs: {"enable_thinking": true}` |
 | `MOCR_MODEL_ID` | `binedge/dots.mocr-FP8` | OCR checkpoint (`rednote-hilab/dots.mocr` for BF16) |
 | `MOCR_SERVED_MODEL_NAME` | `dots-mocr` | OCR model name exposed in the API |
 | `MOCR_PORT` | 8001 | OCR model (vLLM) port |
-| `MOCR_GPU_MEMORY_UTIL` | 0.10 | Fraction of unified memory for the OCR instance (~13GB) |
+| `MOCR_GPU_MEMORY_UTIL` | 0.10 | Nominal only — KV size is fixed by `--kv-cache-memory-bytes` |
 | `MOCR_MAX_MODEL_LEN` | 32768 | OCR model context (covers max page image + output) |
 | `MOCR_KV_CACHE_DTYPE` | auto | OCR KV cache precision (BF16; cache is tiny) |
 | `HF_TOKEN` | — | HuggingFace API token (optional — both models open access) |
@@ -228,14 +236,14 @@ All settings live in `.env` (generated by `setup.sh`). Key options:
 | `OCR_PORT` | 8010 | OCR service port |
 | `GPU_MEMORY_UTIL` | 0.4 | Fraction of unified memory for the LLM instance (~51GB) |
 | `MAX_MODEL_LEN` | 262144 | LLM max context length in tokens |
-| `MAX_NUM_SEQS` | 4 | Max concurrent sequences, LLM instance (OCR instance: `MOCR_MAX_NUM_SEQS`, default 4) |
-| `KV_CACHE_DTYPE` | fp8 | LLM KV cache precision — `fp8` or `auto` (BF16 fallback) |
+| `MAX_NUM_SEQS` | 12 | Max concurrent sequences, LLM instance (OCR instance: `MOCR_MAX_NUM_SEQS`, default 12) |
+| `KV_CACHE_DTYPE` | auto | LLM KV cache precision — `auto` (BF16, stable) or `fp8` (2x capacity, crash risk) |
 | `HF_CACHE` | ~/.cache/huggingface | Model weight cache directory (shared) |
 | `OCR_DPI` | 200 | PDF rendering DPI (dots.mocr's recommendation) |
 | `OCR_MAX_TOKENS` | 16384 | Max output tokens per page |
 | `OCR_TEMPERATURE` | 0.1 | OCR sampling temperature |
 | `OCR_TOP_P` | 0.9 | OCR nucleus sampling (dots.mocr reference value) |
-| `OCR_MAX_CONCURRENT_PAGES` | 4 | Pages OCR'd in parallel |
+| `OCR_MAX_CONCURRENT_PAGES` | 12 | Pages OCR'd in parallel |
 | `OCR_MAX_RETRIES` | 2 | Layout-parse retries per page before plain-text fallback |
 | `OCR_MAX_PAGES` | 200 | Max pages per document |
 | `OCR_MAX_FILE_SIZE_MB` | 100 | Max upload size |
@@ -314,8 +322,8 @@ allocates from `10.10.0.0/16` in `/24` slices. Nothing lands on `172.x.x.x`.
 - **dots.mocr FP8 quant** — [binedge/dots.mocr-FP8](https://huggingface.co/binedge/dots.mocr-FP8) quantizes only the 1.5B language decoder (vision tower stays BF16), but publishes no accuracy validation. The smoke tests assert table fidelity to catch quality problems; if OCR output looks degraded, switch to the unquantized original with `MOCR_MODEL_ID=rednote-hilab/dots.mocr`.
 - **Table extraction spot-check** — There is an open upstream report (dots.ocr issue #268) of table columns being merged on newer vLLM versions. Smoke test 5 checks all six columns of the test table survive; spot-check your own complex tables after deploy.
 - **OCR repetition failure mode** — dots-family models can loop endlessly on runs of ellipses/underscores or unrecognizable content. `OCR_MAX_TOKENS` caps the damage and the service retries, but if a page reliably loops, try a higher `dpi` (the model struggles at high character-to-pixel ratios).
-- **FP8 KV cache issues (LLM)** — If you see CUDA stream capture errors or FlashInfer kernel crashes, switch to BF16 KV cache by setting `KV_CACHE_DTYPE=auto` in `.env` and restarting.
-- **GPU memory** — The DGX Spark uses unified memory shared by both instances. Defaults: Qwen 0.4 (~51GB, NVIDIA's Spark recommendation); the dots.mocr instance sizes its KV cache with an explicit `--kv-cache-memory-bytes 4GB` (weights ~5GB + KV 4GB ≈ 9GB) because on unified memory a fractional `gpu-memory-utilization` budget counts *all* system usage — including the other vLLM instance — and would be exhausted before allocation. Net: ~68GB left for the OS and OCR service.
+- **KV cache is BF16 by default** — `KV_CACHE_DTYPE=fp8` doubles KV capacity (to ~10x full-context concurrency) but produced an intermittent `CUDA illegal memory access` engine crash under mixed concurrent load in benchmarking on SM12.1 (FlashInfer FP8 KV path). BF16 still holds ~1.4M KV tokens (~5.4x full 262K contexts) — ample for 12-way typical traffic.
+- **GPU memory** — The DGX Spark uses unified memory shared by both instances. Defaults: Qwen 0.4 (~51GB, NVIDIA's Spark recommendation); the dots.mocr instance sizes its KV cache with an explicit `--kv-cache-memory-bytes 8GB` (weights ~5GB + KV 8GB ≈ 13GB) because on unified memory a fractional `gpu-memory-utilization` budget counts *all* system usage — including the other vLLM instance — and would be exhausted before allocation. Net: ~50GB left for the OS and OCR service.
 - **First startup is slow** — Models must be downloaded on first run (~23GB + ~5GB). Subsequent starts use the cached weights; `--load-format fastsafetensors` speeds up the Qwen load from cache.
 - **Warmup** — The first request to each instance after startup takes up to ~60s due to torch.compile/CUDA graph warmup. Subsequent requests are fast.
 - **fastsafetensors** — If the LLM fails at startup with a load-format error (e.g. a custom image without the `fastsafetensors` package), remove `--load-format fastsafetensors` from `VLLM_EXTRA_FLAGS`.
