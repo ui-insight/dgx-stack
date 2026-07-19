@@ -44,9 +44,9 @@ story.append(Paragraph(
 ))
 story.append(Paragraph(
     "The DGX Spark is a compact Grace-Blackwell workstation with 128&nbsp;GB of "
-    "unified memory, a GB10 SoC, and CUDA 13. This stack runs a single multimodal "
-    "model (Gemma 4 26B or Qwen 3.5 35B) that serves both the chat endpoint and "
-    "the OCR endpoint, so there is only one set of weights resident in memory.",
+    "unified memory, a GB10 SoC, and CUDA 13. This stack runs two models side "
+    "by side: Qwen 3.6 35B NVFP4 serving the chat endpoint, and the dots.mocr "
+    "document-parsing model serving the OCR endpoint.",
     body,
 ))
 story.append(Paragraph(
@@ -68,7 +68,7 @@ story.append(Spacer(1, 0.15 * inch))
 
 data = [
     ["Model", "Params", "Active", "Weights", "Context", "Tok/s"],
-    ["Gemma 4 26B", "26B", "4B",  "52 GB (BF16)", "128K", "41.7"],
+    ["Qwen 3.6 35B", "35B", "3B", "23 GB (NVFP4)", "262K", "71.3"],
     ["Qwen 3.5 35B", "35B", "3B", "35 GB (FP8)",  "262K", "58.2"],
     ["Llama 3.1 70B", "70B", "70B", "140 GB (BF16)", "128K", "12.4"],
     ["Phi-4 14B", "14B", "14B", "28 GB (BF16)", "16K", "94.6"],
@@ -121,7 +121,7 @@ code = ParagraphStyle(
 )
 story.append(Paragraph(
     "{<br/>"
-    '&nbsp;&nbsp;"model": "qwen3.5-35b",<br/>'
+    '&nbsp;&nbsp;"model": "qwen3.6-35b",<br/>'
     '&nbsp;&nbsp;"messages": [<br/>'
     '&nbsp;&nbsp;&nbsp;&nbsp;{"role": "user", "content": "Summarise page 2."}<br/>'
     "&nbsp;&nbsp;],<br/>"

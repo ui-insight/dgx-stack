@@ -1,16 +1,20 @@
 """
-OCR service that converts documents to markdown using Gemma 4 multimodal via vLLM.
+OCR service that converts documents to markdown using dots.mocr via vLLM.
 
-Accepts PDF, images, and Office documents. Converts pages to images, processes
-them in overlapping chunks through the vision LLM, and merges results using
-difflib sequence matching (same approach as mindrouter /v1/ocrmd).
+Accepts PDF, images, and Office documents. Converts each page to an image and
+sends it to dots.mocr (a document-parsing VLM) one page per request — the
+model is trained page-at-a-time. The layout-JSON response (bbox + category +
+text per element, reading order) is rendered to markdown the same way the
+upstream dots.mocr pipeline does: tables stay HTML, formulas become LaTeX
+blocks, page headers/footers are dropped.
 """
 
 import asyncio
 import base64
-import difflib
 import io
+import json
 import os
+import re
 import secrets
 import subprocess
 import tempfile
@@ -27,21 +31,28 @@ from PIL import Image
 # Configuration from environment
 # ---------------------------------------------------------------------------
 
-VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8000")
-VLLM_MODEL = os.environ.get("VLLM_MODEL", "gemma-4-26b")
+VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8001")
+VLLM_MODEL = os.environ.get("VLLM_MODEL", "dots-mocr")
 OCR_PORT = int(os.environ.get("OCR_PORT", "8010"))
 
-CHUNK_SIZE = int(os.environ.get("OCR_CHUNK_SIZE", "6"))
-OVERLAP = int(os.environ.get("OCR_OVERLAP", "2"))
+# 200 DPI is the dots.mocr team's recommendation for PDF rendering; the
+# server-side processor caps images at ~11.3MP itself, so the client
+# only guards against extreme dimensions (their reference uses 4500px).
 DPI = int(os.environ.get("OCR_DPI", "200"))
 MAX_TOKENS = int(os.environ.get("OCR_MAX_TOKENS", "16384"))
 TEMPERATURE = float(os.environ.get("OCR_TEMPERATURE", "0.1"))
-MAX_CONCURRENT = int(os.environ.get("OCR_MAX_CONCURRENT_CHUNKS", "4"))
-MIN_CHARS_PER_PAGE = int(os.environ.get("OCR_MIN_CHARS_PER_PAGE", "400"))
+TOP_P = float(os.environ.get("OCR_TOP_P", "0.9"))
+MAX_CONCURRENT = int(os.environ.get("OCR_MAX_CONCURRENT_PAGES", "4"))
 MAX_RETRIES = int(os.environ.get("OCR_MAX_RETRIES", "2"))
 MAX_PAGES = int(os.environ.get("OCR_MAX_PAGES", "200"))
 MAX_FILE_SIZE_MB = int(os.environ.get("OCR_MAX_FILE_SIZE_MB", "100"))
-MAX_IMAGE_DIM = 2048
+MAX_IMAGE_DIM = 4500
+
+# dots.mocr's image placeholder must be inlined at the start of the text
+# segment — without it vLLM inserts the placeholder itself followed by a
+# newline, which is not how the model was trained (see the upstream
+# inference.py in rednote-hilab/dots.mocr).
+IMG_PLACEHOLDER = "<|img|><|imgpad|><|endofimg|>"
 
 IMAGE_MIMES = {
     "image/png", "image/jpeg", "image/webp", "image/gif",
@@ -58,7 +69,7 @@ OFFICE_MIMES = {
 }
 OFFICE_EXTENSIONS = {".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt"}
 
-app = FastAPI(title="OCR Service", version="1.0.0")
+app = FastAPI(title="OCR Service", version="2.0.0")
 
 
 # ---------------------------------------------------------------------------
@@ -110,13 +121,12 @@ def images_from_pdf_bytes(pdf_bytes: bytes, dpi: int) -> list[Image.Image]:
     return convert_from_bytes(pdf_bytes, dpi=dpi)
 
 
-def images_from_pdf_range(pdf_bytes: bytes, first: int, last: int, dpi: int) -> list[Image.Image]:
-    """Convert a specific page range (1-indexed, inclusive) from a PDF."""
-    return convert_from_bytes(pdf_bytes, dpi=dpi, first_page=first, last_page=last)
-
-
 def images_from_image_bytes(data: bytes) -> list[Image.Image]:
-    img = Image.open(io.BytesIO(data))
+    try:
+        img = Image.open(io.BytesIO(data))
+        img.load()
+    except Exception:
+        raise HTTPException(400, "Could not decode image file")
     frames = []
     try:
         while True:
@@ -133,79 +143,131 @@ def office_to_pdf_bytes(data: bytes, filename: str) -> bytes:
         src = os.path.join(tmpdir, f"input{ext}")
         with open(src, "wb") as f:
             f.write(data)
-        subprocess.run(
+        result = subprocess.run(
             ["libreoffice", "--headless", "--convert-to", "pdf", "--outdir", tmpdir, src],
-            check=True, timeout=120, capture_output=True,
+            timeout=120, capture_output=True,
         )
-        pdf_path = os.path.join(tmpdir, f"input.pdf")
+        pdf_path = os.path.join(tmpdir, "input.pdf")
+        if result.returncode != 0 or not os.path.exists(pdf_path):
+            detail = (result.stderr or b"").decode(errors="replace")[-300:]
+            raise HTTPException(500, f"Office-to-PDF conversion failed: {detail or 'no output produced'}")
         with open(pdf_path, "rb") as f:
             return f.read()
 
 
 # ---------------------------------------------------------------------------
-# Chunking
+# dots.mocr prompts (verbatim from rednote-hilab/dots.mocr prompts.py)
 # ---------------------------------------------------------------------------
 
-def make_chunks(n_pages: int, chunk_size: int, overlap: int) -> list[tuple[int, int]]:
-    """Return list of (start, end) tuples (0-indexed, end exclusive)."""
-    if n_pages == 0:
-        return []
-    stride = max(chunk_size - overlap, 1)
-    chunks = []
-    for start in range(0, n_pages, stride):
-        end = min(start + chunk_size, n_pages)
-        chunks.append((start, end))
-        if end >= n_pages:
-            break
-    return chunks
+# Primary: full layout parse. Output is a single JSON object listing every
+# layout element with bbox, category, and text (tables as HTML, formulas as
+# LaTeX, everything else markdown), sorted in reading order.
+DOTS_LAYOUT_PROMPT = """Please output the layout information from the PDF image, including each layout element's bbox, its category, and the corresponding text content within the bbox.
+
+1. Bbox format: [x1, y1, x2, y2]
+
+2. Layout Categories: The possible categories are ['Caption', 'Footnote', 'Formula', 'List-item', 'Page-footer', 'Page-header', 'Picture', 'Section-header', 'Table', 'Text', 'Title'].
+
+3. Text Extraction & Formatting Rules:
+    - Picture: For the 'Picture' category, the text field should be omitted.
+    - Formula: Format its text as LaTeX.
+    - Table: Format its text as HTML.
+    - All Others (Text, Title, etc.): Format their text as Markdown.
+
+4. Constraints:
+    - The output text must be the original text from the image, with no translation.
+    - All layout elements must be sorted according to human reading order.
+
+5. Final Output: The entire output must be a single JSON object.
+"""
+
+# Fallback: plain text extraction (used when the layout JSON cannot be
+# parsed after retries).
+DOTS_TEXT_PROMPT = "Extract the text content from this image."
 
 
 # ---------------------------------------------------------------------------
-# LLM call per chunk
+# Layout JSON → markdown (same rendering rules as the upstream pipeline)
 # ---------------------------------------------------------------------------
 
-OCR_PROMPT = (
-    "Convert ALL of the following page images to well-structured markdown. "
-    "Render tables as proper markdown tables with correct columns and rows. "
-    "Do not add any preamble like 'Here is the markdown' - just output the "
-    "markdown directly. Preserve all text exactly as it appears. Do not "
-    "summarize or omit anything. Do not add any commentary. "
-    "There are {n} page images - make sure you process EVERY page."
-)
-
-OCR_RETRY_PROMPT = (
-    "IMPORTANT: You MUST convert ALL {n} page images to markdown. Your "
-    "previous attempt was incomplete. Process every single page image below "
-    "and output the complete markdown. Do not skip any page. "
-    "Render tables as proper markdown tables. Output markdown directly with "
-    "no preamble or commentary."
-)
+_SKIP_CATEGORIES = {"Page-header", "Page-footer"}
 
 
-async def ocr_chunk(
-    client: httpx.AsyncClient,
-    page_b64s: list[str],
-    retry: bool = False,
+def _extract_json(text: str):
+    """Parse the model's layout output into a list of element dicts."""
+    t = text.strip()
+    # Strip markdown fences even when preamble/commentary surrounds them
+    fence = re.search(r"```(?:json)?\s*(.*?)\s*```", t, re.DOTALL)
+    if fence:
+        t = fence.group(1)
+    data = json.loads(t)
+    if isinstance(data, dict):
+        # Some outputs wrap the element list in a single-key object; only
+        # unwrap values that look like element lists (bbox values are lists
+        # of ints, which must not be mistaken for the element list).
+        for v in data.values():
+            if isinstance(v, list) and v and all(isinstance(e, dict) for e in v):
+                return v
+        return [data]
+    if isinstance(data, list):
+        return data
+    raise ValueError("layout JSON is neither list nor object")
+
+
+def _element_to_markdown(el: dict) -> Optional[str]:
+    if not isinstance(el, dict):
+        return None
+    category = el.get("category", "Text")
+    if category in _SKIP_CATEGORIES or category == "Picture":
+        return None
+    text = (el.get("text") or "").strip()
+    if not text:
+        return None
+    if category == "Formula":
+        if not text.startswith("$"):
+            return f"$$\n{text}\n$$"
+        return text
+    # Tables arrive as HTML and are valid inside markdown as-is; Section
+    # headers/titles/list items already arrive markdown-formatted.
+    return text
+
+
+def _render_elements(elements: list) -> str:
+    parts = []
+    for el in elements:
+        md = _element_to_markdown(el)
+        if md:
+            parts.append(md)
+    return "\n\n".join(parts)
+
+
+def layout_json_to_markdown(raw: str) -> str:
+    """Render dots.mocr layout JSON to markdown. Raises on unparseable JSON."""
+    return _render_elements(_extract_json(raw))
+
+
+# ---------------------------------------------------------------------------
+# LLM call per page
+# ---------------------------------------------------------------------------
+
+async def _mocr_request(
+    client: httpx.AsyncClient, page_b64: str, prompt: str,
 ) -> tuple[str, dict]:
-    """Send a chunk of page images to the vision LLM. Returns (text, usage)."""
-    n = len(page_b64s)
-    prompt = (OCR_RETRY_PROMPT if retry else OCR_PROMPT).format(n=n)
-
-    content = [{"type": "text", "text": prompt}]
-    for b64 in page_b64s:
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/png;base64,{b64}"},
-        })
-
     payload = {
         "model": VLLM_MODEL,
-        "messages": [{"role": "user", "content": content}],
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url",
+                 "image_url": {"url": f"data:image/png;base64,{page_b64}"}},
+                {"type": "text", "text": f"{IMG_PLACEHOLDER}{prompt}"},
+            ],
+        }],
         "max_tokens": MAX_TOKENS,
         "temperature": TEMPERATURE,
+        "top_p": TOP_P,
         "stream": False,
     }
-
     resp = await client.post(
         f"{VLLM_BASE_URL}/v1/chat/completions",
         json=payload,
@@ -213,117 +275,73 @@ async def ocr_chunk(
     )
     resp.raise_for_status()
     data = resp.json()
-    text = data["choices"][0]["message"]["content"]
+    text = data["choices"][0]["message"]["content"] or ""
     usage = data.get("usage", {})
-
-    # Strip wrapping markdown fences
-    if text.startswith("```markdown"):
-        text = text[len("```markdown"):].strip()
-    if text.startswith("```"):
-        text = text[3:].strip()
-    if text.endswith("```"):
-        text = text[:-3].strip()
-
     return text, usage
 
 
-async def ocr_chunk_with_retry(
+def _accumulate(total: dict, usage: dict) -> None:
+    for k in total:
+        total[k] += usage.get(k, 0)
+
+
+async def ocr_page(
     client: httpx.AsyncClient,
-    page_b64s: list[str],
+    page_b64: str,
     semaphore: asyncio.Semaphore,
+    page_num: int = 0,
 ) -> tuple[str, dict]:
-    """OCR a chunk, retrying if the output looks too short."""
+    """OCR one page: layout parse → markdown, with retries and a plain-text
+    fallback if the layout JSON never parses.
+
+    A successful parse is the acceptance signal: repetition loops and
+    truncation produce invalid JSON, while a parsed element list — even one
+    that renders to empty markdown (picture-only page) — is a real result.
+    An empty element list ([]) is retried in case the model bailed early;
+    if it stays empty across retries the page is genuinely blank.
+    Transport/HTTP errors count as failed attempts and are retried; if the
+    backend never responds usefully the document fails with a 502 naming
+    the page rather than a generic 500.
+    """
+    total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     async with semaphore:
-        text, usage = await ocr_chunk(client, page_b64s, retry=False)
-        n_pages = len(page_b64s)
-        for _ in range(MAX_RETRIES):
-            if len(text) >= MIN_CHARS_PER_PAGE * n_pages:
-                break
-            text, usage = await ocr_chunk(client, page_b64s, retry=True)
-        return text, usage
-
-
-# ---------------------------------------------------------------------------
-# Deterministic chunk merging (difflib, same approach as mindrouter)
-# ---------------------------------------------------------------------------
-
-def _normalize(line: str) -> str:
-    return " ".join(line.lower().split())
-
-
-def merge_chunks(texts: list[str]) -> str:
-    if not texts:
-        return ""
-    if len(texts) == 1:
-        return texts[0]
-
-    merged = texts[0]
-    for i in range(1, len(texts)):
-        merged = _merge_pair(merged, texts[i])
-    return merged
-
-
-def _merge_pair(a: str, b: str) -> str:
-    a_lines = a.splitlines()
-    b_lines = b.splitlines()
-    if not a_lines or not b_lines:
-        return a + "\n\n" + b
-
-    # Take tail ~40% of a, head ~40% of b for overlap detection
-    tail_len = max(int(len(a_lines) * 0.4), 10)
-    head_len = max(int(len(b_lines) * 0.4), 10)
-    a_tail = a_lines[-tail_len:]
-    b_head = b_lines[:head_len]
-
-    a_norm = [_normalize(l) for l in a_tail]
-    b_norm = [_normalize(l) for l in b_head]
-
-    sm = difflib.SequenceMatcher(None, a_norm, b_norm, autojunk=False)
-    blocks = sm.get_matching_blocks()
-
-    # Find best contiguous match (merge nearby blocks within 5 lines)
-    best_a_end = 0
-    best_b_end = 0
-    best_size = 0
-    for block in blocks:
-        if block.size == 0:
-            continue
-        size = block.size
-        a_end = block.a + block.size
-        b_end = block.b + block.size
-        if size > best_size:
-            best_size = size
-            best_a_end = a_end
-            best_b_end = b_end
-
-    if best_size < 3:
-        # No meaningful overlap found, just concatenate
-        return a.rstrip() + "\n\n" + b.lstrip()
-
-    # Cut a at end of match region, continue b from end of match region
-    a_cut = len(a_lines) - tail_len + best_a_end
-    b_cut = best_b_end
-
-    result_lines = a_lines[:a_cut] + [""] + b_lines[b_cut:]
-    return "\n".join(result_lines)
+        parsed_empty = False
+        last_err = None
+        for _ in range(1 + MAX_RETRIES):
+            try:
+                raw, usage = await _mocr_request(client, page_b64, DOTS_LAYOUT_PROMPT)
+            except httpx.HTTPError as e:
+                last_err = e
+                continue
+            _accumulate(total_usage, usage)
+            try:
+                elements = _extract_json(raw)
+            except (ValueError, json.JSONDecodeError):
+                continue
+            if elements:
+                return _render_elements(elements), total_usage
+            parsed_empty = True
+        if parsed_empty:
+            return "", total_usage
+        # Layout parsing kept failing — fall back to plain text extraction.
+        try:
+            text, usage = await _mocr_request(client, page_b64, DOTS_TEXT_PROMPT)
+        except httpx.HTTPError as e:
+            raise HTTPException(
+                502, f"OCR backend error on page {page_num}: {type(e).__name__}: {e}"
+            ) from e
+        _accumulate(total_usage, usage)
+        return text.strip(), total_usage
 
 
 # ---------------------------------------------------------------------------
 # Pipeline orchestration
 # ---------------------------------------------------------------------------
 
-async def process_document(
-    data: bytes,
-    mime: str,
-    filename: str,
-    chunk_size: int,
-    overlap: int,
-    dpi: int,
-) -> tuple[str, int, int, dict]:
-    """
-    Full OCR pipeline. Returns (markdown, page_count, chunks_processed, usage).
-    """
-    # Step 1: get page images
+def _document_to_b64_pages(data: bytes, mime: str, filename: str, dpi: int) -> list[str]:
+    """Blocking part of the pipeline: rasterize the document and encode
+    pages. Runs in a worker thread so LibreOffice/poppler/PIL work does
+    not stall the event loop."""
     if mime in PDF_MIMES:
         pages = images_from_pdf_bytes(data, dpi)
     elif mime in IMAGE_MIMES:
@@ -339,36 +357,41 @@ async def process_document(
     if len(pages) > MAX_PAGES:
         raise HTTPException(400, f"Document has {len(pages)} pages, max is {MAX_PAGES}")
 
-    page_count = len(pages)
+    return [_image_to_b64(p) for p in pages]
 
-    # Step 2: convert all pages to base64
-    page_b64s = [_image_to_b64(p) for p in pages]
 
-    # Step 3: build chunks
-    chunks = make_chunks(page_count, chunk_size, overlap)
+async def process_document(
+    data: bytes,
+    mime: str,
+    filename: str,
+    dpi: int,
+) -> tuple[str, int, dict]:
+    """
+    Full OCR pipeline. Returns (markdown, page_count, usage).
+    """
+    # Steps 1+2: rasterize + encode off the event loop
+    page_b64s = await asyncio.to_thread(_document_to_b64_pages, data, mime, filename, dpi)
+    page_count = len(page_b64s)
 
-    # Step 4: OCR each chunk concurrently
+    # Step 3: OCR each page concurrently (dots.mocr is a single-page model)
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
     total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
     async with httpx.AsyncClient() as client:
-        tasks = []
-        for start, end in chunks:
-            chunk_pages = page_b64s[start:end]
-            tasks.append(ocr_chunk_with_retry(client, chunk_pages, semaphore))
+        results = await asyncio.gather(*[
+            ocr_page(client, b64, semaphore, page_num=i + 1)
+            for i, b64 in enumerate(page_b64s)
+        ])
 
-        results = await asyncio.gather(*tasks)
-
-    chunk_texts = []
+    page_texts = []
     for text, usage in results:
-        chunk_texts.append(text)
-        for k in total_usage:
-            total_usage[k] += usage.get(k, 0)
+        page_texts.append(text)
+        _accumulate(total_usage, usage)
 
-    # Step 5: merge overlapping chunks
-    markdown = merge_chunks(chunk_texts)
+    # Step 4: join pages (no overlap dedup needed — pages are disjoint)
+    markdown = "\n\n".join(t for t in page_texts if t)
 
-    return markdown, page_count, len(chunks), total_usage
+    return markdown, page_count, total_usage
 
 
 # ---------------------------------------------------------------------------
@@ -380,36 +403,46 @@ async def health():
     return {"status": "ok"}
 
 
+DPI_MIN, DPI_MAX = 40, 400
+
+
+def _clamp_dpi(dpi: int) -> int:
+    return max(DPI_MIN, min(dpi, DPI_MAX))
+
+
 @app.post("/v1/ocr")
 async def ocr_endpoint(
     file: UploadFile = File(...),
+    # model is accepted for API compatibility but ignored — the service
+    # always talks to the single model its vLLM backend serves.
     model: Optional[str] = Form(None),
     output_format: str = Form("markdown"),
-    chunk_size: int = Form(CHUNK_SIZE),
-    overlap: int = Form(OVERLAP),
+    # chunk_size/overlap are accepted (as raw strings, so stale clients
+    # sending anything don't 422) but ignored: dots.mocr processes
+    # exactly one page per request.
+    chunk_size: Optional[str] = Form(None),
+    overlap: Optional[str] = Form(None),
     dpi: int = Form(DPI),
 ):
     """OCR a document and return structured JSON result."""
-    use_model = model or VLLM_MODEL
-
     data = await file.read()
     if len(data) > MAX_FILE_SIZE_MB * 1024 * 1024:
         raise HTTPException(400, f"File too large, max {MAX_FILE_SIZE_MB}MB")
 
     mime = _detect_mime(file)
-    markdown, page_count, chunks_processed, usage = await process_document(
-        data, mime, file.filename or "", chunk_size, overlap, dpi,
+    markdown, page_count, usage = await process_document(
+        data, mime, file.filename or "", _clamp_dpi(dpi),
     )
 
     return JSONResponse({
         "id": f"ocr-{secrets.token_hex(12)}",
         "object": "ocr.result",
         "created": int(time.time()),
-        "model": use_model,
+        "model": VLLM_MODEL,
         "content": markdown,
         "format": output_format,
         "pages": page_count,
-        "chunks_processed": chunks_processed,
+        "chunks_processed": page_count,
         "usage": usage,
     })
 
@@ -418,8 +451,8 @@ async def ocr_endpoint(
 async def ocrmd_endpoint(
     file: UploadFile = File(...),
     model: Optional[str] = Form(None),
-    chunk_size: int = Form(CHUNK_SIZE),
-    overlap: int = Form(OVERLAP),
+    chunk_size: Optional[str] = Form(None),
+    overlap: Optional[str] = Form(None),
     dpi: int = Form(DPI),
 ):
     """OCR a document and return raw markdown."""
@@ -428,8 +461,8 @@ async def ocrmd_endpoint(
         raise HTTPException(400, f"File too large, max {MAX_FILE_SIZE_MB}MB")
 
     mime = _detect_mime(file)
-    markdown, _, _, _ = await process_document(
-        data, mime, file.filename or "", chunk_size, overlap, dpi,
+    markdown, _, _ = await process_document(
+        data, mime, file.filename or "", _clamp_dpi(dpi),
     )
 
     return PlainTextResponse(markdown, media_type="text/markdown")

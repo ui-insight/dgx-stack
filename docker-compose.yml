@@ -1,6 +1,6 @@
 services:
   vllm:
-    image: ${VLLM_IMAGE:-vllm/vllm-openai:gemma4-cu130}
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:vllm-arm64-cu13-0.25.1-7a33ba9}
     container_name: vllm-server
     runtime: nvidia
     deploy:
@@ -15,26 +15,71 @@ services:
     ports:
       - "${VLLM_PORT:-8000}:${VLLM_PORT:-8000}"
     environment:
-      - VLLM_FLASHINFER_MOE_BACKEND=latency
-      - VLLM_TEST_FORCE_FP8_MARLIN=${VLLM_TEST_FORCE_FP8_MARLIN:-0}
-      - VLLM_USE_DEEP_GEMM=${VLLM_USE_DEEP_GEMM:-1}
       - HF_TOKEN=${HF_TOKEN}
-      - HF_MODEL_ID=${HF_MODEL_ID:-google/gemma-4-26B-A4B-it}
-      - SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-gemma-4-26b}
+      - HF_MODEL_ID=${HF_MODEL_ID:-nvidia/Qwen3.6-35B-A3B-NVFP4}
+      - SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-qwen3.6-35b}
       - VLLM_PORT=${VLLM_PORT:-8000}
       - KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-fp8}
-      - MAX_MODEL_LEN=${MAX_MODEL_LEN:-131072}
+      - MAX_MODEL_LEN=${MAX_MODEL_LEN:-262144}
       - MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-8192}
-      - GPU_MEMORY_UTIL=${GPU_MEMORY_UTIL:-0.75}
+      - GPU_MEMORY_UTIL=${GPU_MEMORY_UTIL:-0.4}
       - MAX_NUM_SEQS=${MAX_NUM_SEQS:-4}
-      - VLLM_EXTRA_FLAGS=${VLLM_EXTRA_FLAGS:---no-enable-prefix-caching}
-      - VLLM_ENABLE_THINKING_DEFAULT=${VLLM_ENABLE_THINKING_DEFAULT:-}
+      - VLLM_EXTRA_FLAGS=${VLLM_EXTRA_FLAGS:---no-enable-prefix-caching --reasoning-parser qwen3 --tool-call-parser qwen3_xml --enable-auto-tool-choice --attention-backend flashinfer --moe-backend marlin --enable-chunked-prefill --async-scheduling --load-format fastsafetensors}
+      - VLLM_SPECULATIVE_TOKENS=${VLLM_SPECULATIVE_TOKENS:-3}
+      - VLLM_ENABLE_THINKING_DEFAULT=${VLLM_ENABLE_THINKING_DEFAULT:-true}
     volumes:
       - ${HF_CACHE:-~/.cache/huggingface}:/root/.cache/huggingface
       - ./vllm-entrypoint.sh:/entrypoint.sh:ro
     entrypoint: ["/bin/bash", "/entrypoint.sh"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:${VLLM_PORT:-8000}/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 300s
+    restart: unless-stopped
+    networks:
+      - dgx-net
+
+  # Dedicated OCR model: dots.mocr (~3B VLM specialized for document
+  # parsing) served as a second vLLM instance alongside the main LLM.
+  # Both share the DGX Spark's 128GB unified memory: qwen at 0.4
+  # (~51GB) + mocr at 0.10 (~13GB) leaves ~64GB for OS + OCR service.
+  mocr:
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:vllm-arm64-cu13-0.25.1-7a33ba9}
+    container_name: mocr-server
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host
+    shm_size: "16gb"
+    ports:
+      - "${MOCR_PORT:-8001}:${MOCR_PORT:-8001}"
+    environment:
+      - HF_TOKEN=${HF_TOKEN}
+      - HF_MODEL_ID=${MOCR_MODEL_ID:-binedge/dots.mocr-FP8}
+      - SERVED_MODEL_NAME=${MOCR_SERVED_MODEL_NAME:-dots-mocr}
+      - VLLM_PORT=${MOCR_PORT:-8001}
+      - KV_CACHE_DTYPE=${MOCR_KV_CACHE_DTYPE:-auto}
+      - MAX_MODEL_LEN=${MOCR_MAX_MODEL_LEN:-32768}
+      - MAX_NUM_BATCHED_TOKENS=${MOCR_MAX_NUM_BATCHED_TOKENS:-16384}
+      - GPU_MEMORY_UTIL=${MOCR_GPU_MEMORY_UTIL:-0.10}
+      - MAX_NUM_SEQS=${MOCR_MAX_NUM_SEQS:-4}
+      - VLLM_EXTRA_FLAGS=${MOCR_VLLM_EXTRA_FLAGS:---enable-prefix-caching --enable-chunked-prefill --chat-template-content-format string --kv-cache-memory-bytes 4294967296}
+      - VLLM_LIMIT_MM_PER_PROMPT={"image":1}
+      - VLLM_SPECULATIVE_TOKENS=0
+      - VLLM_ENABLE_THINKING_DEFAULT=
+    volumes:
+      - ${HF_CACHE:-~/.cache/huggingface}:/root/.cache/huggingface
+      - ./vllm-entrypoint.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${MOCR_PORT:-8001}/health"]
       interval: 30s
       timeout: 10s
       retries: 20
@@ -51,21 +96,19 @@ services:
     ports:
       - "${OCR_PORT:-8010}:${OCR_PORT:-8010}"
     environment:
-      - VLLM_BASE_URL=http://vllm:${VLLM_PORT:-8000}
-      - VLLM_MODEL=${SERVED_MODEL_NAME:-gemma-4-26b}
+      - VLLM_BASE_URL=http://mocr:${MOCR_PORT:-8001}
+      - VLLM_MODEL=${MOCR_SERVED_MODEL_NAME:-dots-mocr}
       - OCR_PORT=${OCR_PORT:-8010}
-      - OCR_CHUNK_SIZE=${OCR_CHUNK_SIZE:-6}
-      - OCR_OVERLAP=${OCR_OVERLAP:-2}
-      - OCR_DPI=${OCR_DPI:-120}
+      - OCR_DPI=${OCR_DPI:-200}
       - OCR_MAX_TOKENS=${OCR_MAX_TOKENS:-16384}
       - OCR_TEMPERATURE=${OCR_TEMPERATURE:-0.1}
-      - OCR_MAX_CONCURRENT_CHUNKS=${OCR_MAX_CONCURRENT_CHUNKS:-4}
-      - OCR_MIN_CHARS_PER_PAGE=400
-      - OCR_MAX_RETRIES=2
+      - OCR_TOP_P=${OCR_TOP_P:-0.9}
+      - OCR_MAX_CONCURRENT_PAGES=${OCR_MAX_CONCURRENT_PAGES:-4}
+      - OCR_MAX_RETRIES=${OCR_MAX_RETRIES:-2}
       - OCR_MAX_PAGES=${OCR_MAX_PAGES:-200}
       - OCR_MAX_FILE_SIZE_MB=${OCR_MAX_FILE_SIZE_MB:-100}
     depends_on:
-      vllm:
+      mocr:
         condition: service_healthy
     restart: unless-stopped
     networks:

@@ -20,7 +20,8 @@ With this config in place:
 * No container or network ends up on `172.x.x.x`.
 
 Note: the `dgx-stack` Compose file additionally pins its own network
-to `10.10.0.0/24` explicitly, so the stack works correctly regardless
+to `10.10.99.0/24` by default (overridable via `DGX_NET_SUBNET` /
+`DGX_NET_GATEWAY` in `.env`), so the stack works correctly regardless
 of whether this daemon config is installed.
 
 ## Installing
@@ -28,8 +29,8 @@ of whether this daemon config is installed.
 **This change requires root and restarts the Docker daemon**, which
 briefly stops all running containers on the host. The recommended
 path is to let `setup.sh` offer to install it on your behalf — the
-script will diff any existing `/etc/docker/daemon.json`, back it up,
-merge the address-pool setting, and restart `docker.service`.
+script backs up any existing `/etc/docker/daemon.json`, merges the
+address-pool setting into it, and restarts `docker.service`.
 
 To install manually:
 

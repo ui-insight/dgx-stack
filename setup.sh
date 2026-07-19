@@ -18,6 +18,26 @@ RESET='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# ───────────────────────────────────────────────────────────────────────────
+# Model defaults — two vLLM instances on the pinned 0.25.1 release
+# (ARM64 + CUDA 13 for DGX Spark):
+#   LLM: Qwen 3.6 35B MoE, NVIDIA NVFP4 pre-quantized checkpoint
+#   OCR: dots.mocr document-parsing VLM, FP8 quant (vision unquantized)
+# ───────────────────────────────────────────────────────────────────────────
+DEFAULT_VLLM_IMAGE="vllm/vllm-openai:vllm-arm64-cu13-0.25.1-7a33ba9"
+DEFAULT_HF_MODEL_ID="nvidia/Qwen3.6-35B-A3B-NVFP4"
+DEFAULT_SERVED_MODEL_NAME="qwen3.6-35b"
+# Note: prefix caching is explicitly disabled for the Qwen instance —
+# it corrupts hybrid-attention state when combined with MTP speculative
+# decoding on this vLLM release (vLLM issue #43559).
+DEFAULT_VLLM_EXTRA_FLAGS="--no-enable-prefix-caching --reasoning-parser qwen3 --tool-call-parser qwen3_xml --enable-auto-tool-choice --attention-backend flashinfer --moe-backend marlin --enable-chunked-prefill --async-scheduling --load-format fastsafetensors"
+DEFAULT_MOCR_MODEL_ID="binedge/dots.mocr-FP8"
+DEFAULT_MOCR_SERVED_MODEL_NAME="dots-mocr"
+# kv-cache-memory-bytes: fixed 4GB KV for the OCR instance — on unified
+# memory a fractional gpu-memory-utilization budget is consumed by the
+# LLM instance's allocation before this instance starts.
+DEFAULT_MOCR_VLLM_EXTRA_FLAGS="--enable-prefix-caching --enable-chunked-prefill --chat-template-content-format string --kv-cache-memory-bytes 4294967296"
+
 banner() {
     clear 2>/dev/null || true
     echo ""
@@ -41,7 +61,9 @@ ask() {
         echo -ne "${BOLD}${prompt}${RESET}: "
     fi
     read -r input
-    eval "$var=\"${input:-$default}\""
+    # printf -v assigns without eval, so quotes/$()/backticks in the
+    # answer are stored literally instead of being executed.
+    printf -v "$var" '%s' "${input:-$default}"
 }
 
 confirm() {
@@ -111,8 +133,10 @@ check_docker() {
 detect_state() {
     HAS_ENV=false
     VLLM_RUNNING=false
+    MOCR_RUNNING=false
     OCR_RUNNING=false
     VLLM_EXISTS=false
+    MOCR_EXISTS=false
     OCR_EXISTS=false
 
     [[ -f ".env" ]] && HAS_ENV=true
@@ -122,6 +146,13 @@ detect_state() {
         VLLM_EXISTS=true
     elif docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^vllm-server$'; then
         VLLM_EXISTS=true
+    fi
+
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^mocr-server$'; then
+        MOCR_RUNNING=true
+        MOCR_EXISTS=true
+    elif docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^mocr-server$'; then
+        MOCR_EXISTS=true
     fi
 
     if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^ocr-service$'; then
@@ -136,7 +167,7 @@ show_state() {
     echo -e "${BOLD}── Current State ──${RESET}"
     if [[ "$HAS_ENV" == true ]]; then
         local model
-        model=$(grep -E '^SERVED_MODEL_NAME=' .env 2>/dev/null | cut -d= -f2)
+        model=$(grep -E '^SERVED_MODEL_NAME=' .env 2>/dev/null | cut -d= -f2- | tr -d '"' || true)
         printf "  %-20s ${GREEN}found${RESET} (model: %s)\n" ".env config:" "${model:-unknown}"
     else
         printf "  %-20s ${DIM}not found${RESET}\n" ".env config:"
@@ -148,6 +179,14 @@ show_state() {
         printf "  %-20s ${YELLOW}stopped${RESET}\n" "vllm-server:"
     else
         printf "  %-20s ${DIM}not present${RESET}\n" "vllm-server:"
+    fi
+
+    if [[ "$MOCR_RUNNING" == true ]]; then
+        printf "  %-20s ${GREEN}running${RESET}\n" "mocr-server:"
+    elif [[ "$MOCR_EXISTS" == true ]]; then
+        printf "  %-20s ${YELLOW}stopped${RESET}\n" "mocr-server:"
+    else
+        printf "  %-20s ${DIM}not present${RESET}\n" "mocr-server:"
     fi
 
     if [[ "$OCR_RUNNING" == true ]]; then
@@ -207,12 +246,12 @@ action_fresh_install() {
     step "Fresh Install"
     echo ""
 
-    if [[ "$VLLM_EXISTS" == true ]] || [[ "$OCR_EXISTS" == true ]] || [[ "$HAS_ENV" == true ]]; then
+    if [[ "$VLLM_EXISTS" == true ]] || [[ "$MOCR_EXISTS" == true ]] || [[ "$OCR_EXISTS" == true ]] || [[ "$HAS_ENV" == true ]]; then
         warn "Existing installation detected."
         echo ""
         echo "Fresh install will:"
-        [[ "$VLLM_RUNNING" == true || "$OCR_RUNNING" == true ]] && echo "  • Stop running containers"
-        [[ "$VLLM_EXISTS" == true || "$OCR_EXISTS" == true ]] && echo "  • Remove existing containers"
+        [[ "$VLLM_RUNNING" == true || "$MOCR_RUNNING" == true || "$OCR_RUNNING" == true ]] && echo "  • Stop running containers"
+        [[ "$VLLM_EXISTS" == true || "$MOCR_EXISTS" == true || "$OCR_EXISTS" == true ]] && echo "  • Remove existing containers"
         [[ "$HAS_ENV" == true ]] && echo "  • Back up and overwrite .env"
         echo ""
         echo -e "  ${DIM}(Model weights in HF cache will be preserved)${RESET}"
@@ -227,7 +266,7 @@ action_fresh_install() {
         stop_and_remove_containers
     fi
 
-    select_model
+    set_model_defaults
     configure_interactive
     review
     write_env
@@ -246,7 +285,7 @@ action_reinstall() {
     if [[ "$HAS_ENV" != true ]]; then
         error "No .env found. Use Fresh Install instead."
         echo ""
-        confirm "Return to menu?" "y" && main_menu
+        confirm "Return to menu?" "y" && main_menu || true
         return
     fi
 
@@ -267,6 +306,13 @@ action_reinstall() {
 
     # Load env just to show the user what model is configured
     load_env_values
+
+    # Re-Install deploys straight from .env, so a migrated legacy config
+    # must be written back before compose reads it.
+    if [[ "$ENV_MIGRATED" == true ]]; then
+        info "Writing migrated configuration back to .env"
+        write_env
+    fi
 
     stop_and_remove_containers
 
@@ -291,7 +337,7 @@ action_repair() {
     if [[ "$HAS_ENV" != true ]]; then
         error "No .env found. Use Fresh Install instead."
         echo ""
-        confirm "Return to menu?" "y" && main_menu
+        confirm "Return to menu?" "y" && main_menu || true
         return
     fi
 
@@ -299,12 +345,7 @@ action_repair() {
     load_env_values
     echo ""
 
-    echo "Current model: ${SERVED_MODEL_NAME:-unknown}"
-    if confirm "Keep current model, or switch?" "y"; then
-        info "Keeping current model."
-    else
-        select_model
-    fi
+    echo "Model: ${SERVED_MODEL_NAME:-unknown} (${HF_MODEL_ID:-unknown})"
     echo ""
 
     configure_interactive
@@ -334,18 +375,18 @@ action_test() {
     if [[ "$HAS_ENV" != true ]]; then
         error "No .env found. There is nothing deployed to test."
         echo ""
-        confirm "Return to menu?" "y" && main_menu
+        confirm "Return to menu?" "y" && main_menu || true
         return
     fi
 
     # Make sure VLLM_PORT / OCR_PORT etc. are in the environment for the checks.
     load_env_values
 
-    if [[ "$VLLM_RUNNING" != true ]] && [[ "$OCR_RUNNING" != true ]]; then
-        error "Neither vllm-server nor ocr-service is running."
+    if [[ "$VLLM_RUNNING" != true ]] && [[ "$MOCR_RUNNING" != true ]] && [[ "$OCR_RUNNING" != true ]]; then
+        error "None of vllm-server, mocr-server, or ocr-service is running."
         info  "Start the stack with Re-Install (option 2) or 'docker compose up -d'."
         echo ""
-        confirm "Return to menu?" "y" && main_menu
+        confirm "Return to menu?" "y" && main_menu || true
         return
     fi
 
@@ -356,6 +397,11 @@ action_test() {
     else
         error "vllm-server is NOT running"
     fi
+    if [[ "$MOCR_RUNNING" == true ]]; then
+        info "mocr-server is running"
+    else
+        error "mocr-server is NOT running"
+    fi
     if [[ "$OCR_RUNNING" == true ]]; then
         info "ocr-service is running"
     else
@@ -365,9 +411,14 @@ action_test() {
     echo ""
     echo -e "${BOLD}── HTTP health ──${RESET}"
     if curl -sf --max-time 5 "http://localhost:${VLLM_PORT}/health" &>/dev/null; then
-        info "vLLM  /health  OK  (port ${VLLM_PORT})"
+        info "LLM   /health  OK  (port ${VLLM_PORT})"
     else
-        error "vLLM  /health  failed  (port ${VLLM_PORT})"
+        error "LLM   /health  failed  (port ${VLLM_PORT})"
+    fi
+    if curl -sf --max-time 5 "http://localhost:${MOCR_PORT}/health" &>/dev/null; then
+        info "MOCR  /health  OK  (port ${MOCR_PORT})"
+    else
+        error "MOCR  /health  failed  (port ${MOCR_PORT})"
     fi
     if curl -sf --max-time 5 "http://localhost:${OCR_PORT}/health" &>/dev/null \
        || curl -sf --max-time 5 "http://localhost:${OCR_PORT}/" &>/dev/null; then
@@ -380,7 +431,7 @@ action_test() {
     run_smoke_tests
 
     echo ""
-    confirm "Return to menu?" "y" && main_menu
+    confirm "Return to menu?" "y" && main_menu || true
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -401,7 +452,7 @@ action_configure_networks() {
     if [[ ! -f "$template" ]]; then
         error "Template not found at ${template}"
         echo ""
-        confirm "Return to menu?" "y" && main_menu
+        confirm "Return to menu?" "y" && main_menu || true
         return
     fi
 
@@ -438,7 +489,7 @@ action_configure_networks() {
         else
             error "Not running as root and sudo is not available."
             echo ""
-            confirm "Return to menu?" "y" && main_menu
+            confirm "Return to menu?" "y" && main_menu || true
             return
         fi
     fi
@@ -467,7 +518,7 @@ sys.stdout.write(json.dumps(existing, indent=2) + "\n")
             error "Failed to merge existing ${target} with template."
             error "Existing file may contain invalid JSON. Aborting."
             echo ""
-            confirm "Return to menu?" "y" && main_menu
+            confirm "Return to menu?" "y" && main_menu || true
             return
         fi
         printf '%s' "$merged" | $SUDO tee "$target" >/dev/null
@@ -485,7 +536,7 @@ sys.stdout.write(json.dumps(existing, indent=2) + "\n")
         error "docker.service restart failed."
         error "Check:  $SUDO systemctl status docker"
         echo ""
-        confirm "Return to menu?" "y" && main_menu
+        confirm "Return to menu?" "y" && main_menu || true
         return
     fi
 
@@ -516,7 +567,7 @@ sys.stdout.write(json.dumps(existing, indent=2) + "\n")
     info "To move this stack onto the new pool, run Re-Install (option 2)."
     echo ""
 
-    confirm "Return to menu?" "y" && main_menu
+    confirm "Return to menu?" "y" && main_menu || true
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -528,10 +579,10 @@ action_turn_off() {
     step "Turn Off"
     echo ""
 
-    if [[ "$VLLM_RUNNING" != true ]] && [[ "$OCR_RUNNING" != true ]]; then
+    if [[ "$VLLM_RUNNING" != true ]] && [[ "$MOCR_RUNNING" != true ]] && [[ "$OCR_RUNNING" != true ]]; then
         info "No containers are currently running."
         echo ""
-        confirm "Return to menu?" "y" && main_menu
+        confirm "Return to menu?" "y" && main_menu || true
         return
     fi
 
@@ -558,9 +609,10 @@ action_view_logs() {
     echo ""
     step "View Logs"
     echo ""
-    echo "  1) Both services"
-    echo "  2) vLLM only"
-    echo "  3) OCR only"
+    echo "  1) All services"
+    echo "  2) LLM (vllm-server) only"
+    echo "  3) OCR model (mocr-server) only"
+    echo "  4) OCR service only"
     echo "  b) Back to menu"
     echo ""
     local choice
@@ -569,7 +621,8 @@ action_view_logs() {
     case "$choice" in
         1) docker compose logs --tail=200 -f ;;
         2) docker compose logs --tail=200 -f vllm ;;
-        3) docker compose logs --tail=200 -f ocr ;;
+        3) docker compose logs --tail=200 -f mocr ;;
+        4) docker compose logs --tail=200 -f ocr ;;
         *) main_menu ;;
     esac
 }
@@ -579,11 +632,11 @@ action_view_logs() {
 # ───────────────────────────────────────────────────────────────────────────
 
 stop_and_remove_containers() {
-    if [[ "$VLLM_EXISTS" == true ]] || [[ "$OCR_EXISTS" == true ]]; then
+    if [[ "$VLLM_EXISTS" == true ]] || [[ "$MOCR_EXISTS" == true ]] || [[ "$OCR_EXISTS" == true ]]; then
         step "Stopping and removing existing containers..."
         docker compose down 2>/dev/null || {
             # Fallback if compose state is inconsistent
-            docker rm -f vllm-server ocr-service 2>/dev/null || true
+            docker rm -f vllm-server mocr-server ocr-service 2>/dev/null || true
         }
         detect_state
     fi
@@ -604,128 +657,123 @@ load_env_values() {
         # Trim leading whitespace from key
         key="${key#"${key%%[![:space:]]*}"}"
         key="${key%"${key##*[![:space:]]}"}"
-        # Strip surrounding single or double quotes from value
-        if [[ "$value" =~ ^\"(.*)\"$ ]]; then
+        # Strip surrounding single or double quotes from value; for
+        # unquoted values also strip inline comments and trailing
+        # whitespace (matching Docker Compose's dotenv behavior).
+        if [[ "$value" =~ ^\"([^\"]*)\" ]]; then
             value="${BASH_REMATCH[1]}"
-        elif [[ "$value" =~ ^\'(.*)\'$ ]]; then
+        elif [[ "$value" =~ ^\'([^\']*)\' ]]; then
             value="${BASH_REMATCH[1]}"
+        else
+            value="${value%%[[:space:]]#*}"
+            value="${value%"${value##*[![:space:]]}"}"
         fi
-        # Only allow valid identifier keys
+        # Only allow valid identifier keys; skip readonly names (UID,
+        # EUID, …) that would abort the script under set -e.
         [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
-        printf -v "$key" '%s' "$value"
+        printf -v "$key" '%s' "$value" 2>/dev/null || true
     done < .env
 
     # Set defaults for anything missing
-    VLLM_IMAGE="${VLLM_IMAGE:-vllm/vllm-openai:gemma4-cu130}"
-    HF_MODEL_ID="${HF_MODEL_ID:-google/gemma-4-26B-A4B-it}"
-    SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-gemma-4-26b}"
-    VLLM_EXTRA_FLAGS="${VLLM_EXTRA_FLAGS:---no-enable-prefix-caching}"
-    VLLM_TEST_FORCE_FP8_MARLIN="${VLLM_TEST_FORCE_FP8_MARLIN:-0}"
-    VLLM_USE_DEEP_GEMM="${VLLM_USE_DEEP_GEMM:-1}"
-    VLLM_ENABLE_THINKING_DEFAULT="${VLLM_ENABLE_THINKING_DEFAULT:-}"
+    VLLM_IMAGE="${VLLM_IMAGE:-$DEFAULT_VLLM_IMAGE}"
+    HF_MODEL_ID="${HF_MODEL_ID:-$DEFAULT_HF_MODEL_ID}"
+    SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-$DEFAULT_SERVED_MODEL_NAME}"
+    VLLM_EXTRA_FLAGS="${VLLM_EXTRA_FLAGS:-$DEFAULT_VLLM_EXTRA_FLAGS}"
+    VLLM_SPECULATIVE_TOKENS="${VLLM_SPECULATIVE_TOKENS:-3}"
+    VLLM_ENABLE_THINKING_DEFAULT="${VLLM_ENABLE_THINKING_DEFAULT:-true}"
     HF_TOKEN="${HF_TOKEN:-}"
     HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
     VLLM_PORT="${VLLM_PORT:-8000}"
     OCR_PORT="${OCR_PORT:-8010}"
     DGX_NET_SUBNET="${DGX_NET_SUBNET:-10.10.99.0/24}"
     DGX_NET_GATEWAY="${DGX_NET_GATEWAY:-10.10.99.1}"
-    GPU_MEMORY_UTIL="${GPU_MEMORY_UTIL:-0.75}"
-    MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
+    GPU_MEMORY_UTIL="${GPU_MEMORY_UTIL:-0.4}"
+    MAX_MODEL_LEN="${MAX_MODEL_LEN:-262144}"
     MAX_NUM_SEQS="${MAX_NUM_SEQS:-4}"
     MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
     KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
-    OCR_CHUNK_SIZE="${OCR_CHUNK_SIZE:-6}"
-    OCR_OVERLAP="${OCR_OVERLAP:-2}"
-    OCR_DPI="${OCR_DPI:-120}"
+    MOCR_MODEL_ID="${MOCR_MODEL_ID:-$DEFAULT_MOCR_MODEL_ID}"
+    MOCR_SERVED_MODEL_NAME="${MOCR_SERVED_MODEL_NAME:-$DEFAULT_MOCR_SERVED_MODEL_NAME}"
+    MOCR_VLLM_EXTRA_FLAGS="${MOCR_VLLM_EXTRA_FLAGS:-$DEFAULT_MOCR_VLLM_EXTRA_FLAGS}"
+    MOCR_PORT="${MOCR_PORT:-8001}"
+    MOCR_GPU_MEMORY_UTIL="${MOCR_GPU_MEMORY_UTIL:-0.10}"
+    MOCR_MAX_MODEL_LEN="${MOCR_MAX_MODEL_LEN:-32768}"
+    MOCR_MAX_NUM_SEQS="${MOCR_MAX_NUM_SEQS:-4}"
+    MOCR_MAX_NUM_BATCHED_TOKENS="${MOCR_MAX_NUM_BATCHED_TOKENS:-16384}"
+    MOCR_KV_CACHE_DTYPE="${MOCR_KV_CACHE_DTYPE:-auto}"
+    OCR_DPI="${OCR_DPI:-200}"
     OCR_MAX_TOKENS="${OCR_MAX_TOKENS:-16384}"
-    OCR_MAX_CONCURRENT_CHUNKS="${OCR_MAX_CONCURRENT_CHUNKS:-4}"
+    OCR_TEMPERATURE="${OCR_TEMPERATURE:-0.1}"
+    OCR_TOP_P="${OCR_TOP_P:-0.9}"
+    OCR_MAX_CONCURRENT_PAGES="${OCR_MAX_CONCURRENT_PAGES:-4}"
+    OCR_MAX_RETRIES="${OCR_MAX_RETRIES:-2}"
     OCR_MAX_PAGES="${OCR_MAX_PAGES:-200}"
     OCR_MAX_FILE_SIZE_MB="${OCR_MAX_FILE_SIZE_MB:-100}"
 
-    # Derive MODEL_CHOICE and NEEDS_HF_TOKEN from the model ID
-    if [[ "$HF_MODEL_ID" == *"gemma"* ]]; then
-        MODEL_CHOICE="gemma4"
-        NEEDS_HF_TOKEN=true
-        DEFAULT_MAX_MODEL_LEN="131072"
-        DEFAULT_MAX_NUM_BATCHED_TOKENS="8192"
-        DEFAULT_GPU_MEMORY_UTIL="0.75"
-        DEFAULT_KV_CACHE_DTYPE="fp8"
-    else
-        MODEL_CHOICE="qwen35"
-        NEEDS_HF_TOKEN=false
-        DEFAULT_MAX_MODEL_LEN="131072"
-        DEFAULT_MAX_NUM_BATCHED_TOKENS="8192"
-        DEFAULT_GPU_MEMORY_UTIL="0.75"
-        DEFAULT_KV_CACHE_DTYPE="fp8"
-    fi
+    # Migrate pre-dots.mocr configs. Old .envs pin images/models that the
+    # three-container stack cannot run: the mocr service would inherit a
+    # pre-0.25.1 image with no dots_ocr support, and the entrypoint would
+    # add an MTP speculative config to a model without an MTP head.
+    ENV_MIGRATED=false
+    case "${VLLM_IMAGE:-}" in
+        *gemma4-cu130*|*cu130-nightly*)
+            warn "Legacy model config detected in .env (model: ${SERVED_MODEL_NAME:-unknown})."
+            warn "Resetting model, image, and serving flags to the current defaults."
+            VLLM_IMAGE="$DEFAULT_VLLM_IMAGE"
+            HF_MODEL_ID="$DEFAULT_HF_MODEL_ID"
+            SERVED_MODEL_NAME="$DEFAULT_SERVED_MODEL_NAME"
+            VLLM_EXTRA_FLAGS="$DEFAULT_VLLM_EXTRA_FLAGS"
+            VLLM_ENABLE_THINKING_DEFAULT="true"
+            VLLM_SPECULATIVE_TOKENS=3
+            MAX_MODEL_LEN=262144
+            GPU_MEMORY_UTIL=0.4
+            ENV_MIGRATED=true
+            ;;
+    esac
 }
 
 # ───────────────────────────────────────────────────────────────────────────
-# Model selection
+# Model defaults
 # ───────────────────────────────────────────────────────────────────────────
 
-select_model() {
-    echo -e "${BOLD}── Model Selection ──${RESET}"
+set_model_defaults() {
+    echo -e "${BOLD}── Models ──${RESET}"
     echo ""
-    echo "  Both models serve as LLM and OCR (multimodal vision)."
+    echo -e "  ${BOLD}LLM: Qwen 3.6 35B NVFP4${RESET} ${DIM}(nvidia/Qwen3.6-35B-A3B-NVFP4)${RESET}"
+    echo "     MoE 35B total / 3B active, NVFP4 ~23GB weights"
+    echo "     262K context, MTP speculative decoding, port 8000"
     echo ""
-    echo -e "  ${BOLD}1)${RESET} Qwen 3.5 35B FP8 ${DIM}(Qwen/Qwen3.5-35B-A3B-FP8)${RESET}"
-    echo "     MoE 35B total / 3B active, FP8 ~35GB weights"
-    echo "     262K context, excellent OCR and table handling"
-    echo "     Open access, no token required"
+    echo -e "  ${BOLD}OCR: dots.mocr FP8${RESET} ${DIM}(binedge/dots.mocr-FP8)${RESET}"
+    echo "     ~3B document-parsing VLM, FP8 ~5GB weights"
+    echo "     Vision tower unquantized, port 8001"
     echo ""
-    echo -e "  ${BOLD}2)${RESET} Gemma 4 26B  ${DIM}(google/gemma-4-26B-A4B-it)${RESET}"
-    echo "     MoE 26B total / 4B active, BF16 ~52GB weights"
-    echo "     128K context, strong general LLM"
-    echo "     Requires HuggingFace token + license acceptance"
+    echo "  Both are open access — no HuggingFace token required."
     echo ""
 
-    local choice
-    ask "Select model (1 or 2)" "1" choice
+    VLLM_IMAGE="$DEFAULT_VLLM_IMAGE"
+    HF_MODEL_ID="$DEFAULT_HF_MODEL_ID"
+    SERVED_MODEL_NAME="$DEFAULT_SERVED_MODEL_NAME"
+    VLLM_EXTRA_FLAGS="$DEFAULT_VLLM_EXTRA_FLAGS"
+    VLLM_SPECULATIVE_TOKENS="${VLLM_SPECULATIVE_TOKENS:-3}"
+    # Serve-time default for the chat template. Setting this is what
+    # makes per-request chat_template_kwargs.enable_thinking=false
+    # overrides actually take effect with --reasoning-parser qwen3.
+    VLLM_ENABLE_THINKING_DEFAULT="true"
 
-    case "$choice" in
-        1)
-            MODEL_CHOICE="qwen35"
-            VLLM_IMAGE="vllm/vllm-openai:cu130-nightly"
-            HF_MODEL_ID="Qwen/Qwen3.5-35B-A3B-FP8"
-            SERVED_MODEL_NAME="qwen3.5-35b"
-            DEFAULT_MAX_MODEL_LEN="131072"
-            DEFAULT_MAX_NUM_BATCHED_TOKENS="8192"
-            DEFAULT_GPU_MEMORY_UTIL="0.75"
-            DEFAULT_KV_CACHE_DTYPE="fp8"
-            VLLM_EXTRA_FLAGS="--enable-prefix-caching --reasoning-parser qwen3"
-            VLLM_TEST_FORCE_FP8_MARLIN=1
-            VLLM_USE_DEEP_GEMM=0
-            # Serve-time default for the chat template. Setting this is what
-            # makes per-request chat_template_kwargs.enable_thinking=false
-            # overrides actually take effect with --reasoning-parser qwen3.
-            VLLM_ENABLE_THINKING_DEFAULT="true"
-            NEEDS_HF_TOKEN=false
-            info "Selected: Qwen 3.5 35B (FP8 pre-quantized)"
-            info "FP8 weights ~35GB — leaves ~61GB for KV cache at 0.75 util."
-            ;;
-        2)
-            MODEL_CHOICE="gemma4"
-            VLLM_IMAGE="vllm/vllm-openai:gemma4-cu130"
-            HF_MODEL_ID="google/gemma-4-26B-A4B-it"
-            SERVED_MODEL_NAME="gemma-4-26b"
-            DEFAULT_MAX_MODEL_LEN="131072"
-            DEFAULT_MAX_NUM_BATCHED_TOKENS="8192"
-            DEFAULT_GPU_MEMORY_UTIL="0.75"
-            DEFAULT_KV_CACHE_DTYPE="fp8"
-            VLLM_EXTRA_FLAGS="--no-enable-prefix-caching"
-            VLLM_TEST_FORCE_FP8_MARLIN=0
-            VLLM_USE_DEEP_GEMM=1
-            VLLM_ENABLE_THINKING_DEFAULT=""
-            NEEDS_HF_TOKEN=true
-            info "Selected: Gemma 4 26B"
-            ;;
-        *)
-            error "Invalid choice. Please enter 1 or 2."
-            select_model
-            ;;
-    esac
-    echo ""
+    MOCR_MODEL_ID="$DEFAULT_MOCR_MODEL_ID"
+    MOCR_SERVED_MODEL_NAME="$DEFAULT_MOCR_SERVED_MODEL_NAME"
+    MOCR_VLLM_EXTRA_FLAGS="$DEFAULT_MOCR_VLLM_EXTRA_FLAGS"
+
+    # Defaults for values that configure_interactive does not prompt for —
+    # on Fresh Install (no .env, load_env_values never runs) write_env
+    # would otherwise hit unbound variables under set -u.
+    MOCR_MAX_MODEL_LEN="${MOCR_MAX_MODEL_LEN:-32768}"
+    MOCR_MAX_NUM_SEQS="${MOCR_MAX_NUM_SEQS:-4}"
+    MOCR_MAX_NUM_BATCHED_TOKENS="${MOCR_MAX_NUM_BATCHED_TOKENS:-16384}"
+    MOCR_KV_CACHE_DTYPE="${MOCR_KV_CACHE_DTYPE:-auto}"
+    OCR_TEMPERATURE="${OCR_TEMPERATURE:-0.1}"
+    OCR_TOP_P="${OCR_TOP_P:-0.9}"
+    OCR_MAX_RETRIES="${OCR_MAX_RETRIES:-2}"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -734,59 +782,35 @@ select_model() {
 
 configure_interactive() {
     # ── HuggingFace Token ──
-    if [[ "$NEEDS_HF_TOKEN" == true ]]; then
-        echo -e "${BOLD}── HuggingFace Token ──${RESET}"
-        echo "Gemma 4 is a gated model. You need a HuggingFace token with access."
-        echo "Get one at: https://huggingface.co/settings/tokens"
-        echo "Accept the license at: https://huggingface.co/google/gemma-4-26B-A4B-it"
-        echo ""
+    echo -e "${BOLD}── HuggingFace Token ──${RESET}"
+    echo "The NVFP4 checkpoint is open access. Token is optional."
+    echo ""
 
-        local hf_default="${HF_TOKEN:-}"
-        if [[ -z "$hf_default" ]] && [[ -f "$HOME/.cache/huggingface/token" ]]; then
-            hf_default=$(cat "$HOME/.cache/huggingface/token")
-            info "Found cached HuggingFace token."
-        fi
+    local hf_default="${HF_TOKEN:-}"
+    if [[ -z "$hf_default" ]] && [[ -f "$HOME/.cache/huggingface/token" ]]; then
+        hf_default=$(cat "$HOME/.cache/huggingface/token" 2>/dev/null || true)
+    fi
 
-        if [[ -n "$hf_default" ]]; then
-            local masked="${hf_default:0:8}...${hf_default: -4}"
-            echo -ne "${BOLD}HuggingFace token${RESET} ${DIM}[${masked}]${RESET}: "
-            read -r input
-            HF_TOKEN="${input:-$hf_default}"
-        else
-            echo -ne "${BOLD}HuggingFace token${RESET}: "
-            read -r HF_TOKEN
-        fi
-
-        if [[ -z "$HF_TOKEN" ]]; then
-            error "HuggingFace token is required for Gemma 4."
-            exit 1
-        fi
+    if [[ -n "$hf_default" ]]; then
+        local masked="${hf_default:0:8}...${hf_default: -4}"
+        echo -ne "${BOLD}HuggingFace token (optional)${RESET} ${DIM}[${masked}]${RESET}: "
+        read -r input
+        HF_TOKEN="${input:-$hf_default}"
     else
-        echo -e "${BOLD}── HuggingFace Token ──${RESET}"
-        echo "Qwen 3.5 is open access. Token is optional."
-        echo ""
-
-        local hf_default="${HF_TOKEN:-}"
-        if [[ -z "$hf_default" ]] && [[ -f "$HOME/.cache/huggingface/token" ]]; then
-            hf_default=$(cat "$HOME/.cache/huggingface/token")
-        fi
-
-        if [[ -n "$hf_default" ]]; then
-            local masked="${hf_default:0:8}...${hf_default: -4}"
-            echo -ne "${BOLD}HuggingFace token (optional)${RESET} ${DIM}[${masked}]${RESET}: "
-            read -r input
-            HF_TOKEN="${input:-$hf_default}"
-        else
-            echo -ne "${BOLD}HuggingFace token (optional, press Enter to skip)${RESET}: "
-            read -r HF_TOKEN
-        fi
+        echo -ne "${BOLD}HuggingFace token (optional, press Enter to skip)${RESET}: "
+        read -r HF_TOKEN
     fi
     echo ""
 
     # ── Ports ──
     echo -e "${BOLD}── Network Ports ──${RESET}"
-    ask "vLLM API port (OpenAI-compatible)" "${VLLM_PORT:-8000}" VLLM_PORT
+    ask "LLM API port (Qwen, OpenAI-compatible)" "${VLLM_PORT:-8000}" VLLM_PORT
+    ask "OCR model port (dots.mocr, OpenAI-compatible)" "${MOCR_PORT:-8001}" MOCR_PORT
     ask "OCR service port" "${OCR_PORT:-8010}" OCR_PORT
+    if [[ "$VLLM_PORT" == "$MOCR_PORT" ]] || [[ "$VLLM_PORT" == "$OCR_PORT" ]] || [[ "$MOCR_PORT" == "$OCR_PORT" ]]; then
+        error "The three ports must be distinct (got LLM=$VLLM_PORT, OCR model=$MOCR_PORT, OCR service=$OCR_PORT)."
+        exit 1
+    fi
     echo ""
 
     # ── Docker Network ──
@@ -808,59 +832,64 @@ print(str(next(net.hosts())))
 
     # ── GPU / Memory ──
     echo -e "${BOLD}── GPU Memory ──${RESET}"
-    echo "DGX Spark has 128GB unified memory shared between CPU and GPU."
-    if [[ "$MODEL_CHOICE" == "qwen35" ]]; then
-        echo "Qwen 3.5 35B FP8 weights are ~35GB. At 0.75 (~96GB), ~61GB"
-        echo "remains for KV cache + OS + OCR container."
-    else
-        echo "Gemma 4 26B BF16 weights are ~52GB. At 0.75 (~96GB), ~44GB"
-        echo "remains for KV cache + OS + OCR container."
-    fi
+    echo "DGX Spark has 128GB unified memory shared between CPU, GPU, and"
+    echo "BOTH vLLM instances. Defaults: Qwen 0.4 (~51GB, NVIDIA's Spark"
+    echo "recommendation for this checkpoint) + dots.mocr 0.10 (~13GB)."
+    echo "That leaves ~64GB for the OS and the OCR service container."
     echo ""
-    ask "GPU memory utilization (0.5 - 0.90)" "${GPU_MEMORY_UTIL:-$DEFAULT_GPU_MEMORY_UTIL}" GPU_MEMORY_UTIL
+    ask "LLM (Qwen) GPU memory utilization (0.30 - 0.80)" "${GPU_MEMORY_UTIL:-0.4}" GPU_MEMORY_UTIL
+    ask "OCR (dots.mocr) GPU memory utilization (0.05 - 0.20)" "${MOCR_GPU_MEMORY_UTIL:-0.10}" MOCR_GPU_MEMORY_UTIL
     echo ""
 
-    if (( $(echo "$GPU_MEMORY_UTIL < 0.5" | bc -l 2>/dev/null || echo 0) )) || \
-       (( $(echo "$GPU_MEMORY_UTIL > 0.95" | bc -l 2>/dev/null || echo 0) )); then
-        warn "Unusual value: $GPU_MEMORY_UTIL. Recommended range is 0.60 - 0.85."
+    if (( $(echo "$GPU_MEMORY_UTIL < 0.3" | bc -l 2>/dev/null || echo 0) )) || \
+       (( $(echo "$GPU_MEMORY_UTIL > 0.8" | bc -l 2>/dev/null || echo 0) )); then
+        warn "Unusual value: $GPU_MEMORY_UTIL. Recommended range is 0.30 - 0.80."
         if ! confirm "Continue with this value?" "n"; then
+            exit 1
+        fi
+    fi
+
+    # Warn when the two instances together claim most of unified memory.
+    local total_util
+    total_util="$(echo "$GPU_MEMORY_UTIL + $MOCR_GPU_MEMORY_UTIL" | bc -l 2>/dev/null || echo 0)"
+    if (( $(echo "$total_util > 0.85" | bc -l 2>/dev/null || echo 0) )); then
+        warn "Combined GPU memory utilization is ${total_util} of 128GB —"
+        warn "this can starve the OS and OCR container on unified memory."
+        if ! confirm "Continue with these values?" "n"; then
             exit 1
         fi
     fi
 
     # ── Model Config ──
     echo -e "${BOLD}── Model Configuration ──${RESET}"
-    ask "Max context length (tokens)" "${MAX_MODEL_LEN:-$DEFAULT_MAX_MODEL_LEN}" MAX_MODEL_LEN
+    ask "Max context length (tokens)" "${MAX_MODEL_LEN:-262144}" MAX_MODEL_LEN
     ask "Max concurrent sequences" "${MAX_NUM_SEQS:-4}" MAX_NUM_SEQS
-    ask "Max batched tokens (required ≥ Mamba block size for Qwen)" "${MAX_NUM_BATCHED_TOKENS:-$DEFAULT_MAX_NUM_BATCHED_TOKENS}" MAX_NUM_BATCHED_TOKENS
+    ask "Max batched tokens (required ≥ Mamba block size for Qwen)" "${MAX_NUM_BATCHED_TOKENS:-8192}" MAX_NUM_BATCHED_TOKENS
+    ask "Speculative decode tokens (MTP draft length, 0 = off)" "${VLLM_SPECULATIVE_TOKENS:-3}" VLLM_SPECULATIVE_TOKENS
     echo ""
 
     # ── KV Cache ──
     echo -e "${BOLD}── KV Cache ──${RESET}"
-    echo "FP8 KV cache saves memory but may cause FlashInfer errors on some builds."
-    echo "Use 'auto' (BF16) as a fallback if you see CUDA stream capture errors."
+    echo "FP8 KV cache (Qwen instance) saves memory but may cause FlashInfer"
+    echo "errors on some builds. Use 'auto' (BF16) as a fallback if you see"
+    echo "CUDA stream capture errors. The dots.mocr instance always uses auto."
     echo ""
-    ask "KV cache dtype (fp8 or auto)" "${KV_CACHE_DTYPE:-$DEFAULT_KV_CACHE_DTYPE}" KV_CACHE_DTYPE
+    ask "Qwen KV cache dtype (fp8 or auto)" "${KV_CACHE_DTYPE:-fp8}" KV_CACHE_DTYPE
     echo ""
 
     # ── HuggingFace Cache ──
     echo -e "${BOLD}── Storage ──${RESET}"
-    if [[ "$MODEL_CHOICE" == "qwen35" ]]; then
-        echo "Model weights (~35GB FP8) are cached locally to avoid re-downloading."
-    else
-        echo "Model weights (~52GB) are cached locally to avoid re-downloading."
-    fi
+    echo "Model weights (~23GB Qwen NVFP4 + ~5GB dots.mocr FP8) are cached"
+    echo "locally to avoid re-downloading."
     ask "HuggingFace cache directory" "${HF_CACHE:-$HOME/.cache/huggingface}" HF_CACHE
     echo ""
 
     # ── OCR Tuning ──
     echo -e "${BOLD}── OCR Settings ──${RESET}"
-    echo -e "${DIM}These control how documents are split and processed.${RESET}"
-    ask "Pages per chunk" "${OCR_CHUNK_SIZE:-6}" OCR_CHUNK_SIZE
-    ask "Overlap pages between chunks" "${OCR_OVERLAP:-2}" OCR_OVERLAP
-    ask "PDF rendering DPI" "${OCR_DPI:-120}" OCR_DPI
-    ask "Max tokens per LLM response" "${OCR_MAX_TOKENS:-16384}" OCR_MAX_TOKENS
-    ask "Max concurrent chunks" "${OCR_MAX_CONCURRENT_CHUNKS:-4}" OCR_MAX_CONCURRENT_CHUNKS
+    echo -e "${DIM}dots.mocr processes one page per request; pages run in parallel.${RESET}"
+    ask "PDF rendering DPI (200 recommended by dots.mocr)" "${OCR_DPI:-200}" OCR_DPI
+    ask "Max tokens per page response" "${OCR_MAX_TOKENS:-16384}" OCR_MAX_TOKENS
+    ask "Max concurrent pages" "${OCR_MAX_CONCURRENT_PAGES:-4}" OCR_MAX_CONCURRENT_PAGES
     ask "Max pages per document" "${OCR_MAX_PAGES:-200}" OCR_MAX_PAGES
     ask "Max upload file size (MB)" "${OCR_MAX_FILE_SIZE_MB:-100}" OCR_MAX_FILE_SIZE_MB
     echo ""
@@ -874,20 +903,24 @@ review() {
     echo ""
     echo -e "${BOLD}── Configuration Summary ──${RESET}"
     echo ""
-    printf "  %-30s %s\n" "Model:" "${SERVED_MODEL_NAME} (${HF_MODEL_ID})"
+    printf "  %-30s %s\n" "LLM model:" "${SERVED_MODEL_NAME} (${HF_MODEL_ID})"
+    printf "  %-30s %s\n" "OCR model:" "${MOCR_SERVED_MODEL_NAME} (${MOCR_MODEL_ID})"
     printf "  %-30s %s\n" "Container:" "${VLLM_IMAGE}"
-    printf "  %-30s %s\n" "vLLM port:" "$VLLM_PORT"
-    printf "  %-30s %s\n" "OCR port:" "$OCR_PORT"
-    printf "  %-30s %s\n" "GPU memory utilization:" "$GPU_MEMORY_UTIL ($(echo "$GPU_MEMORY_UTIL * 128" | bc)GB of 128GB)"
-    printf "  %-30s %s\n" "Max context length:" "$MAX_MODEL_LEN tokens"
+    printf "  %-30s %s\n" "LLM port:" "$VLLM_PORT"
+    printf "  %-30s %s\n" "OCR model port:" "$MOCR_PORT"
+    printf "  %-30s %s\n" "OCR service port:" "$OCR_PORT"
+    printf "  %-30s %s\n" "LLM GPU memory util:" "$GPU_MEMORY_UTIL ($(echo "$GPU_MEMORY_UTIL * 128" | bc 2>/dev/null || echo "?")GB of 128GB)"
+    printf "  %-30s %s\n" "OCR GPU memory util:" "$MOCR_GPU_MEMORY_UTIL ($(echo "$MOCR_GPU_MEMORY_UTIL * 128" | bc 2>/dev/null || echo "?")GB of 128GB)"
+    printf "  %-30s %s\n" "Max context length (LLM):" "$MAX_MODEL_LEN tokens"
     printf "  %-30s %s\n" "Max concurrent sequences:" "$MAX_NUM_SEQS"
-    printf "  %-30s %s\n" "KV cache dtype:" "$KV_CACHE_DTYPE"
+    printf "  %-30s %s\n" "Speculative tokens (MTP):" "${VLLM_SPECULATIVE_TOKENS:-3}"
+    printf "  %-30s %s\n" "KV cache dtype (LLM):" "$KV_CACHE_DTYPE"
     printf "  %-30s %s\n" "HF cache:" "$HF_CACHE"
-    printf "  %-30s %s\n" "OCR chunk/overlap:" "${OCR_CHUNK_SIZE} pages / ${OCR_OVERLAP} overlap"
     printf "  %-30s %s\n" "OCR DPI:" "$OCR_DPI"
-    printf "  %-30s %s\n" "OCR max tokens:" "$OCR_MAX_TOKENS"
+    printf "  %-30s %s\n" "OCR max tokens/page:" "$OCR_MAX_TOKENS"
+    printf "  %-30s %s\n" "OCR concurrent pages:" "$OCR_MAX_CONCURRENT_PAGES"
     if [[ -n "$VLLM_EXTRA_FLAGS" ]]; then
-        printf "  %-30s %s\n" "Extra vLLM flags:" "$VLLM_EXTRA_FLAGS"
+        printf "  %-30s %s\n" "Extra vLLM flags (LLM):" "$VLLM_EXTRA_FLAGS"
     fi
     echo ""
 }
@@ -908,14 +941,25 @@ write_env() {
 # ─────────────────────────────────────────────
 # DGX Stack Configuration
 # Generated by setup.sh on $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-# Model: ${MODEL_CHOICE}
+# Model: ${SERVED_MODEL_NAME}
 # ─────────────────────────────────────────────
 
-# Model
+# LLM (Qwen 3.6 NVFP4)
 VLLM_IMAGE="${VLLM_IMAGE}"
 HF_MODEL_ID="${HF_MODEL_ID}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME}"
-VLLM_EXTRA_FLAGS="${VLLM_EXTRA_FLAGS:---no-enable-prefix-caching}"
+VLLM_EXTRA_FLAGS="${VLLM_EXTRA_FLAGS}"
+
+# OCR model (dots.mocr)
+MOCR_MODEL_ID="${MOCR_MODEL_ID}"
+MOCR_SERVED_MODEL_NAME="${MOCR_SERVED_MODEL_NAME}"
+MOCR_VLLM_EXTRA_FLAGS="${MOCR_VLLM_EXTRA_FLAGS}"
+MOCR_PORT=${MOCR_PORT}
+MOCR_GPU_MEMORY_UTIL=${MOCR_GPU_MEMORY_UTIL}
+MOCR_MAX_MODEL_LEN=${MOCR_MAX_MODEL_LEN}
+MOCR_MAX_NUM_SEQS=${MOCR_MAX_NUM_SEQS}
+MOCR_MAX_NUM_BATCHED_TOKENS=${MOCR_MAX_NUM_BATCHED_TOKENS}
+MOCR_KV_CACHE_DTYPE=${MOCR_KV_CACHE_DTYPE}
 
 # HuggingFace
 HF_TOKEN="${HF_TOKEN}"
@@ -927,23 +971,22 @@ OCR_PORT=${OCR_PORT}
 DGX_NET_SUBNET=${DGX_NET_SUBNET}
 DGX_NET_GATEWAY=${DGX_NET_GATEWAY}
 
-# GPU / Model
+# GPU / Model (LLM)
 GPU_MEMORY_UTIL=${GPU_MEMORY_UTIL}
 MAX_MODEL_LEN=${MAX_MODEL_LEN}
 MAX_NUM_SEQS=${MAX_NUM_SEQS}
 KV_CACHE_DTYPE=${KV_CACHE_DTYPE}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS}
-VLLM_TEST_FORCE_FP8_MARLIN=${VLLM_TEST_FORCE_FP8_MARLIN}
-VLLM_USE_DEEP_GEMM=${VLLM_USE_DEEP_GEMM}
+VLLM_SPECULATIVE_TOKENS=${VLLM_SPECULATIVE_TOKENS}
 VLLM_ENABLE_THINKING_DEFAULT=${VLLM_ENABLE_THINKING_DEFAULT}
 
-# OCR
-OCR_CHUNK_SIZE=${OCR_CHUNK_SIZE}
-OCR_OVERLAP=${OCR_OVERLAP}
+# OCR service
 OCR_DPI=${OCR_DPI}
 OCR_MAX_TOKENS=${OCR_MAX_TOKENS}
-OCR_TEMPERATURE=0.1
-OCR_MAX_CONCURRENT_CHUNKS=${OCR_MAX_CONCURRENT_CHUNKS}
+OCR_TEMPERATURE=${OCR_TEMPERATURE}
+OCR_TOP_P=${OCR_TOP_P}
+OCR_MAX_CONCURRENT_PAGES=${OCR_MAX_CONCURRENT_PAGES}
+OCR_MAX_RETRIES=${OCR_MAX_RETRIES}
 OCR_MAX_PAGES=${OCR_MAX_PAGES}
 OCR_MAX_FILE_SIZE_MB=${OCR_MAX_FILE_SIZE_MB}
 EOF
@@ -982,44 +1025,57 @@ deploy_start_and_wait() {
     docker compose up -d
 
     echo ""
-    step "Waiting for vLLM to load the model..."
-    if [[ "${MODEL_CHOICE:-}" == "qwen35" ]]; then
-        info "Qwen 3.5 35B FP8 is ~35GB. First request may take ~60s to warm up."
-    else
-        info "Gemma 4 26B is ~52GB. This takes several minutes on first run."
-    fi
+    step "Waiting for both vLLM instances to load their models..."
+    info "Qwen 3.6 35B NVFP4 is ~23GB; dots.mocr FP8 is ~5GB."
+    info "First request to each may take ~60s to warm up."
     echo ""
-    echo -e "${DIM}  Watch progress:  docker compose logs -f vllm${RESET}"
+    echo -e "${DIM}  Watch progress:  docker compose logs -f vllm mocr${RESET}"
     echo -e "${DIM}  Check health:    curl http://localhost:${VLLM_PORT}/health${RESET}"
+    echo -e "${DIM}                   curl http://localhost:${MOCR_PORT:-8001}/health${RESET}"
     echo ""
 
     local max_wait=600
     local elapsed=0
     local interval=10
+    local vllm_up=false mocr_up=false
 
     while (( elapsed < max_wait )); do
-        if curl -sf "http://localhost:${VLLM_PORT}/health" &>/dev/null; then
+        if [[ "$vllm_up" != true ]] && curl -sf "http://localhost:${VLLM_PORT}/health" &>/dev/null; then
+            vllm_up=true
             echo ""
-            info "vLLM is healthy and serving."
+            info "vllm-server (LLM) is healthy and serving."
+        fi
+        if [[ "$mocr_up" != true ]] && curl -sf "http://localhost:${MOCR_PORT:-8001}/health" &>/dev/null; then
+            mocr_up=true
+            echo ""
+            info "mocr-server (OCR model) is healthy and serving."
+        fi
+        if [[ "$vllm_up" == true ]] && [[ "$mocr_up" == true ]]; then
             break
         fi
-        # Check if the container crashed
+        # Check whether either container crashed
         if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^vllm-server$'; then
             echo ""
-            error "vLLM container is no longer running."
+            error "vllm-server container is no longer running."
             error "Check logs: docker compose logs vllm"
             return
         fi
-        echo -ne "\r  Waiting... ${elapsed}s / ${max_wait}s"
+        if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^mocr-server$'; then
+            echo ""
+            error "mocr-server container is no longer running."
+            error "Check logs: docker compose logs mocr"
+            return
+        fi
+        echo -ne "\r  Waiting... ${elapsed}s / ${max_wait}s  (LLM: ${vllm_up}, OCR model: ${mocr_up})"
         sleep "$interval"
         elapsed=$((elapsed + interval))
     done
 
-    if (( elapsed >= max_wait )); then
+    if [[ "$vllm_up" != true ]] || [[ "$mocr_up" != true ]]; then
         echo ""
-        warn "vLLM hasn't become healthy after ${max_wait}s."
-        warn "Check logs: docker compose logs vllm"
-        warn "The service may still be loading. Healthcheck will restart it if needed."
+        warn "Not all instances became healthy after ${max_wait}s (LLM: ${vllm_up}, OCR model: ${mocr_up})."
+        warn "Check logs: docker compose logs vllm mocr"
+        warn "The services may still be loading. Healthchecks will restart them if needed."
         return
     fi
 
@@ -1030,7 +1086,7 @@ deploy_start_and_wait() {
     echo -e "${GREEN}${BOLD}║  Stack is running!                                       ║${RESET}"
     echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════════════════════╝${RESET}"
     echo ""
-    echo "  Model: ${SERVED_MODEL_NAME}"
+    echo "  LLM model: ${SERVED_MODEL_NAME}    OCR model: ${MOCR_SERVED_MODEL_NAME:-dots-mocr}"
     echo ""
     echo "  LLM API (OpenAI-compatible):"
     echo "    http://localhost:${VLLM_PORT}/v1/chat/completions"
@@ -1045,8 +1101,15 @@ deploy_start_and_wait() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
-# Smoke tests — exercise /v1/models, chat completions, and the OCR pipeline
-# against the committed examples/test-doc.pdf after a successful deploy.
+# Smoke tests — exercise both vLLM instances and the OCR pipeline against
+# the committed examples/test-doc.pdf after a successful deploy:
+#   1. LLM  /v1/models          (served id matches config)
+#   2. OCR  /v1/models          (served id matches config)
+#   3. LLM  chat completion     (real answer in content)
+#   4. dots.mocr direct         (page 1 → layout JSON → markdown, in-container)
+#   5. OCR  /v1/ocr JSON        (3 pages, sentinel, table-fidelity assertions)
+#   6. OCR  /v1/ocrmd           (raw markdown + sentinel)
+# followed by a unified-memory usage report.
 # ───────────────────────────────────────────────────────────────────────────
 
 run_smoke_tests() {
@@ -1057,18 +1120,20 @@ run_smoke_tests() {
 
     local pass=0 fail=0
     local chat_url="http://localhost:${VLLM_PORT}"
+    local mocr_url="http://localhost:${MOCR_PORT:-8001}"
     local ocr_url="http://localhost:${OCR_PORT}"
     local test_pdf="${SCRIPT_DIR}/examples/test-doc.pdf"
 
-    # ── Test 1: /v1/models ─────────────────────────────────────────────────
+    # ── Test 1: LLM /v1/models ─────────────────────────────────────────────
     echo ""
-    step "Test 1/3 — GET ${chat_url}/v1/models"
+    step "Test 1/6 — GET ${chat_url}/v1/models  (LLM)"
     local models_json served_id
-    if models_json="$(curl -sf --max-time 15 "${chat_url}/v1/models" 2>/dev/null)"; then
+    models_json="$(curl -sf --max-time 15 "${chat_url}/v1/models" 2>/dev/null || true)"
+    if [[ -n "$models_json" ]]; then
         served_id="$(printf '%s' "$models_json" \
             | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["data"][0]["id"])' 2>/dev/null || true)"
         if [[ -n "$served_id" ]]; then
-            info "Served model id: ${BOLD}${served_id}${RESET}"
+            info "LLM served model id: ${BOLD}${served_id}${RESET}"
             pass=$((pass + 1))
         else
             error "Could not parse model id from response."
@@ -1077,26 +1142,44 @@ run_smoke_tests() {
             fail=$((fail + 1))
         fi
     else
-        error "Request to /v1/models failed."
+        error "Request to LLM /v1/models failed."
         fail=$((fail + 1))
     fi
 
-    # ── Test 2: chat completions ───────────────────────────────────────────
+    # ── Test 2: OCR model /v1/models ───────────────────────────────────────
     echo ""
-    step "Test 2/3 — POST ${chat_url}/v1/chat/completions"
+    step "Test 2/6 — GET ${mocr_url}/v1/models  (OCR model)"
+    local mocr_models_json mocr_served_id
+    mocr_models_json="$(curl -sf --max-time 15 "${mocr_url}/v1/models" 2>/dev/null || true)"
+    if [[ -n "$mocr_models_json" ]]; then
+        mocr_served_id="$(printf '%s' "$mocr_models_json" \
+            | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["data"][0]["id"])' 2>/dev/null || true)"
+        if [[ -n "$mocr_served_id" ]]; then
+            info "OCR served model id: ${BOLD}${mocr_served_id}${RESET}"
+            pass=$((pass + 1))
+        else
+            error "Could not parse model id from response."
+            echo "$mocr_models_json" | head -c 400
+            echo
+            fail=$((fail + 1))
+        fi
+    else
+        error "Request to OCR model /v1/models failed."
+        fail=$((fail + 1))
+    fi
+
+    # ── Test 3: LLM chat completion ────────────────────────────────────────
+    echo ""
+    step "Test 3/6 — POST ${chat_url}/v1/chat/completions  (LLM)"
     if [[ -n "${served_id:-}" ]]; then
-        # Reasoning models (Qwen 3.5 with --reasoning-parser qwen3) split
+        # Reasoning models (Qwen with --reasoning-parser qwen3) split
         # output into reasoning_content + content. Ask for enough tokens to
         # finish thinking *and* produce a final answer, and tell the template
-        # not to emit a thinking block when the model supports that hint.
+        # not to emit a thinking block so the request returns fast without
+        # burning tokens on a <think> block. The per-request override works
+        # because VLLM_ENABLE_THINKING_DEFAULT is plumbed through at serve
+        # time (--default-chat-template-kwargs).
         local chat_body chat_resp http_code chat_content reasoning_content
-        # Note: do NOT pass chat_template_kwargs.enable_thinking=false here.
-        # On Qwen 3.5 + --reasoning-parser qwen3 that combination
-        # causes the parser to misclassify the final answer as reasoning
-        # For reasoning models we disable thinking so the request returns
-        # fast without burning tokens on a <think> block. This relies on
-        # VLLM_ENABLE_THINKING_DEFAULT being plumbed through at serve time;
-        # the chat_template_kwargs override is a no-op on Gemma.
         chat_body="$(python3 -c '
 import json, sys
 print(json.dumps({
@@ -1115,7 +1198,7 @@ print(json.dumps({
         http_code="$(curl -s -o "$tmp_body" -w '%{http_code}' --max-time 180 \
             "${chat_url}/v1/chat/completions" \
             -H "Content-Type: application/json" \
-            -d "$chat_body" 2>/dev/null)"
+            -d "$chat_body" 2>/dev/null || true)"
         [[ -z "$http_code" ]] && http_code="000"
         chat_resp="$(cat "$tmp_body")"
         rm -f "$tmp_body"
@@ -1183,22 +1266,90 @@ except Exception as e:
         fail=$((fail + 1))
     fi
 
-    # ── Test 3: OCR pipeline ───────────────────────────────────────────────
+    # ── Test 4: dots.mocr direct (in-container, exercises the exact
+    #    client code path: prompt, placeholder, JSON→markdown) ─────────────
     echo ""
-    step "Test 3/3 — POST ${ocr_url}/v1/ocrmd  (examples/test-doc.pdf)"
+    step "Test 4/6 — dots.mocr direct page OCR (via ocr-service container)"
     if [[ ! -f "$test_pdf" ]]; then
         warn "Test PDF not found at ${test_pdf} — skipping."
         fail=$((fail + 1))
     else
+        local direct_out
+        direct_out="$(docker exec -i ocr-service python3 -c '
+import json, sys
+import httpx
+from pdf2image import convert_from_bytes
+from app.main import (DOTS_LAYOUT_PROMPT, IMG_PLACEHOLDER, MAX_TOKENS,
+                      TEMPERATURE, TOP_P, VLLM_BASE_URL, VLLM_MODEL,
+                      _image_to_b64, layout_json_to_markdown)
+
+pdf = sys.stdin.buffer.read()
+page = convert_from_bytes(pdf, dpi=200, first_page=1, last_page=1)[0]
+payload = {
+    "model": VLLM_MODEL,
+    "messages": [{"role": "user", "content": [
+        {"type": "image_url",
+         "image_url": {"url": "data:image/png;base64," + _image_to_b64(page)}},
+        {"type": "text", "text": IMG_PLACEHOLDER + DOTS_LAYOUT_PROMPT},
+    ]}],
+    "max_tokens": MAX_TOKENS, "temperature": TEMPERATURE, "top_p": TOP_P,
+}
+out = {"status": 0, "raw_chars": 0, "md_chars": 0, "json_ok": False, "has_title": False}
+try:
+    r = httpx.post(VLLM_BASE_URL + "/v1/chat/completions", json=payload, timeout=600)
+    out["status"] = r.status_code
+    raw = (r.json()["choices"][0]["message"]["content"] or "")
+    out["raw_chars"] = len(raw)
+    md = layout_json_to_markdown(raw)
+    out["json_ok"] = True
+    out["md_chars"] = len(md)
+    out["has_title"] = "DGX Stack OCR Test Document" in md
+except Exception as e:
+    out["error"] = str(e)[:300]
+print(json.dumps(out))
+' < "$test_pdf" 2>/dev/null || echo '{"status":0,"error":"docker exec failed"}')"
+        local direct_verdict
+        direct_verdict="$(printf '%s' "$direct_out" | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read().strip().splitlines()[-1])
+except Exception:
+    print("FAIL|unparseable test output"); raise SystemExit
+if d.get("status") == 200 and d.get("json_ok") and d.get("has_title"):
+    print("PASS|status=200 layout JSON parsed, %d md chars, page title found" % d.get("md_chars", 0))
+elif d.get("status") == 200 and d.get("json_ok"):
+    print("WARN|layout parsed (%d md chars) but page title missing" % d.get("md_chars", 0))
+else:
+    print("FAIL|" + json.dumps(d)[:300])
+' 2>/dev/null || echo 'FAIL|verdict parse error')"
+        case "$direct_verdict" in
+            PASS\|*)
+                info "dots.mocr direct OCR: ${direct_verdict#PASS|}"
+                pass=$((pass + 1)) ;;
+            WARN\|*)
+                warn "dots.mocr direct OCR: ${direct_verdict#WARN|}"
+                pass=$((pass + 1)) ;;
+            *)
+                error "dots.mocr direct OCR failed: ${direct_verdict#FAIL|}"
+                fail=$((fail + 1)) ;;
+        esac
+    fi
+
+    # ── Tests 5+6: OCR service end-to-end ──────────────────────────────────
+    echo ""
+    step "Test 5/6 — POST ${ocr_url}/v1/ocr  (JSON + table fidelity)"
+    if [[ ! -f "$test_pdf" ]]; then
+        warn "Test PDF not found at ${test_pdf} — skipping tests 5 and 6."
+        fail=$((fail + 2))
+    else
         # Preflight: is the OCR container actually up, and is /health reachable?
         local ocr_container_state ocr_health_code
         ocr_container_state="$(docker inspect -f '{{.State.Status}}' ocr-service 2>/dev/null || echo 'missing')"
-        info "Container state: ${ocr_container_state}"
         if [[ "$ocr_container_state" != "running" ]]; then
-            error "ocr-service container is not running."
+            error "ocr-service container is not running (state: ${ocr_container_state})."
             info  "Recent logs (last 30 lines):"
             docker logs --tail 30 ocr-service 2>&1 | sed 's/^/    /' || true
-            fail=$((fail + 1))
+            fail=$((fail + 2))
         else
             local ocr_ready=false
             for _ in 1 2 3 4 5 6; do
@@ -1206,7 +1357,7 @@ except Exception as e:
                 # failure (it writes "000"), so do NOT add `|| echo 000` —
                 # that would concatenate two copies of the failure code.
                 ocr_health_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-                    "${ocr_url}/health" 2>/dev/null)"
+                    "${ocr_url}/health" 2>/dev/null || true)"
                 [[ -z "$ocr_health_code" ]] && ocr_health_code="000"
                 if [[ "$ocr_health_code" == "200" ]]; then
                     ocr_ready=true
@@ -1218,14 +1369,65 @@ except Exception as e:
                 error "OCR /health did not return 200 (last HTTP code: ${ocr_health_code})."
                 info  "Recent logs (last 30 lines):"
                 docker logs --tail 30 ocr-service 2>&1 | sed 's/^/    /' || true
-                fail=$((fail + 1))
+                fail=$((fail + 2))
             else
-                info "OCR /health OK — uploading test PDF (3 pages)..."
+                info "OCR /health OK — uploading test PDF (3 pages, JSON endpoint)..."
+                local json_tmp json_code
+                json_tmp="$(mktemp)"
+                json_code="$(curl -s -o "$json_tmp" -w '%{http_code}' --max-time 900 \
+                    -X POST "${ocr_url}/v1/ocr" \
+                    -F "file=@${test_pdf}" 2>/dev/null || true)"
+                [[ -z "$json_code" ]] && json_code="000"
+
+                if [[ "$json_code" != "200" ]]; then
+                    error "OCR /v1/ocr HTTP ${json_code}."
+                    head -c 500 "$json_tmp"
+                    echo
+                    fail=$((fail + 1))
+                else
+                    # Content assertions: page count, sentinel, and table
+                    # fidelity (all 6 column headers + key cell values from
+                    # page 2 — catches merged-column table regressions).
+                    local ocr_verdict
+                    ocr_verdict="$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+content = d.get("content", "")
+checks = {
+    "pages==3": d.get("pages") == 3,
+    "sentinel": "END-OF-TEST-DOCUMENT" in content,
+    "title": "DGX Stack OCR Test Document" in content,
+}
+for header in ["Model", "Params", "Active", "Weights", "Context", "Tok/s"]:
+    checks["col:" + header] = header in content
+for cell in ["Qwen 3.6 35B", "23 GB (NVFP4)", "58.2", "71.3", "Llama 3.1 70B", "94.6"]:
+    checks["cell:" + cell] = cell in content
+failed = [k for k, v in checks.items() if not v]
+if failed:
+    print("FAIL|" + ",".join(failed) + "|%d chars" % len(content))
+else:
+    print("PASS|%d pages, %d chars, table intact" % (d.get("pages", 0), len(content)))
+' "$json_tmp" 2>/dev/null || echo 'FAIL|response parse error|')"
+                    case "$ocr_verdict" in
+                        PASS\|*)
+                            info "OCR JSON: ${ocr_verdict#PASS|}"
+                            pass=$((pass + 1)) ;;
+                        *)
+                            error "OCR JSON content checks failed: ${ocr_verdict#FAIL|}"
+                            warn  "Failed checks often mean table columns were merged or pages dropped."
+                            fail=$((fail + 1)) ;;
+                    esac
+                fi
+                rm -f "$json_tmp"
+
+                # ── Test 6: raw markdown endpoint ──────────────────────────
+                echo ""
+                step "Test 6/6 — POST ${ocr_url}/v1/ocrmd  (raw markdown)"
                 local ocr_tmp ocr_code
                 ocr_tmp="$(mktemp)"
-                ocr_code="$(curl -s -o "$ocr_tmp" -w '%{http_code}' --max-time 600 \
+                ocr_code="$(curl -s -o "$ocr_tmp" -w '%{http_code}' --max-time 900 \
                     -X POST "${ocr_url}/v1/ocrmd" \
-                    -F "file=@${test_pdf}" 2>/dev/null)"
+                    -F "file=@${test_pdf}" 2>/dev/null || true)"
                 [[ -z "$ocr_code" ]] && ocr_code="000"
                 local ocr_out chars
                 ocr_out="$(cat "$ocr_tmp")"
@@ -1254,12 +1456,19 @@ except Exception as e:
         fi
     fi
 
+    # ── Memory report ──────────────────────────────────────────────────────
+    echo ""
+    echo -e "${BOLD}── Unified memory usage ──${RESET}"
+    free -g 2>/dev/null | sed 's/^/  /' || vm_stat 2>/dev/null | head -5 | sed 's/^/  /' || true
+    docker stats --no-stream --format '  {{.Name}}: {{.MemUsage}}' \
+        vllm-server mocr-server ocr-service 2>/dev/null || true
+
     # ── Summary ────────────────────────────────────────────────────────────
     echo ""
     if (( fail == 0 )); then
-        echo -e "${GREEN}${BOLD}  Smoke tests: ${pass}/3 passed ✓${RESET}"
+        echo -e "${GREEN}${BOLD}  Smoke tests: ${pass}/6 passed ✓${RESET}"
     else
-        echo -e "${YELLOW}${BOLD}  Smoke tests: ${pass}/3 passed, ${fail} failed${RESET}"
+        echo -e "${YELLOW}${BOLD}  Smoke tests: ${pass}/6 passed, ${fail} failed${RESET}"
         echo -e "${DIM}  Check logs:  docker compose logs -f${RESET}"
     fi
 }
