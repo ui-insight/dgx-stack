@@ -343,14 +343,15 @@ the GPU telemetry sidecar) and both vLLM instances as **backends**:
 ```
 
 The installer is idempotent and non-interactive: it clones MindRouter to
-`~/mindrouter`, moves it off the colliding default ports (gateway on
-**8080** — ports 8000/8001 belong to the vLLM instances), generates all
-secrets, runs migrations, seeds the admin account, captures the one-time
-admin API key to `~/mindrouter/.admin_api_key`, registers the node + both
-backends, applies the model/OCR configuration MindRouter needs for these
-specific backends, and smoke-tests a routed chat and OCR request. After
-install, clients use `http://<dgx>:8080/v1` with MindRouter API keys — the
-direct ports keep working unchanged.
+`~/mindrouter`, **auto-selects free host ports** for all of its services
+(the gateway prefers **8080** but steps aside if something like Vandalizer
+already holds it), generates all secrets, runs migrations, seeds the admin
+account, captures the one-time admin API key to `~/mindrouter/.admin_api_key`,
+registers the node + both backends, applies the model/OCR configuration
+MindRouter needs for these specific backends, and smoke-tests a routed chat
+and OCR request. After install, clients use `http://<dgx>:<gateway-port>/v1`
+with MindRouter API keys — the direct vLLM/OCR ports keep working unchanged.
+The chosen ports are recorded in `~/mindrouter/.dgx-ports`.
 
 **Change the seeded dashboard password (admin/admin123) immediately.**
 

@@ -10,23 +10,29 @@ set -euo pipefail
 #   - qwen  (chat LLM)   http://127.0.0.1:${VLLM_PORT}
 #   - mocr  (OCR model)  http://127.0.0.1:${MOCR_PORT}
 #
-# MindRouter's stock dev compose uses host networking with the app on port
-# 8000 and its MCP service on 8001 — both collide with the dgx-stack vLLM
-# ports — so this installer writes a docker-compose.override.yml that moves
-# them (default 8080/8081) and replaces the site-specific /archivedb bind
-# mounts with local paths.
+# MindRouter's stock dev compose uses host networking and binds a fixed set
+# of ports (app 8000, MCP 8001, MariaDB 3306/3307, Redis 6379, sidecar 8007)
+# — several of which collide with the dgx-stack vLLM ports or with a sibling
+# app like Vandalizer. This installer therefore AUTO-SELECTS free ports for
+# every host-bound MindRouter service and writes a docker-compose.override.yml
+# that moves them there (rewriting the app's DB/Redis/MCP connection URLs to
+# match), and replaces the site-specific /archivedb bind mounts with local
+# paths. Chosen ports are pinned in ${MINDROUTER_DIR}/.dgx-ports so re-runs
+# stay stable (moving MariaDB's port after data exists would orphan nothing —
+# the volume is by name — but stable ports avoid surprises).
 #
 # Idempotent: safe to re-run. State that must survive re-runs:
 #   ${MINDROUTER_DIR}/.env             (generated secrets)
 #   ${MINDROUTER_DIR}/.admin_api_key   (admin API key — printed exactly once
 #                                       by MindRouter's seed script)
+#   ${MINDROUTER_DIR}/.dgx-ports       (selected ports)
 #
 # Usage:  ./mindrouter/install-mindrouter.sh
-# Config via environment (defaults shown):
+# Config via environment (all optional; unset ports are auto-selected):
 #   MINDROUTER_DIR=$HOME/mindrouter        install location (git clone)
 #   MINDROUTER_REPO=https://github.com/ui-insight/mindrouter.git
-#   MINDROUTER_PORT=8080                   gateway port
-#   MINDROUTER_MCP_PORT=8081               MCP sidecar port
+#   MINDROUTER_PORT=<auto>                 gateway port (preferred 8080)
+#   MINDROUTER_MCP_PORT=<auto>             MCP service port (preferred 8081)
 #   MINDROUTER_DATA=$HOME/mindrouter-data  artifact storage
 #   MINDROUTER_NODE_NAME=$(hostname -s)    node name to register
 #   DGX_STACK_DIR=<dir of this script>/..  where the dgx-stack .env lives
@@ -42,11 +48,30 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DGX_STACK_DIR="${DGX_STACK_DIR:-$(dirname "$SCRIPT_DIR")}"
 MINDROUTER_DIR="${MINDROUTER_DIR:-$HOME/mindrouter}"
 MINDROUTER_REPO="${MINDROUTER_REPO:-https://github.com/ui-insight/mindrouter.git}"
-MINDROUTER_PORT="${MINDROUTER_PORT:-8080}"
-MINDROUTER_MCP_PORT="${MINDROUTER_MCP_PORT:-8081}"
 MINDROUTER_DATA="${MINDROUTER_DATA:-$HOME/mindrouter-data}"
 MINDROUTER_NODE_NAME="${MINDROUTER_NODE_NAME:-$(hostname -s)}"
-SIDECAR_PORT=8007
+# Ports: an explicit env value is honored; anything left blank is
+# auto-selected (see the port-selection block after the clone).
+MINDROUTER_PORT="${MINDROUTER_PORT:-}"
+MINDROUTER_MCP_PORT="${MINDROUTER_MCP_PORT:-}"
+
+# ── Port helpers ───────────────────────────────────────────────────────────
+port_free() {  # exit 0 if nothing is LISTENing on TCP port $1
+    local p="$1"
+    if command -v ss >/dev/null 2>&1; then
+        ! ss -Htln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}\$"
+    else
+        ! (exec 3<>"/dev/tcp/127.0.0.1/${p}") 2>/dev/null
+    fi
+}
+pick_port() {  # pick_port PREFERRED EXCLUDE... -> first free port near PREFERRED
+    local pref="$1"; shift; local excl=" $* " cand
+    for cand in "$pref" $(seq $((pref + 10)) $((pref + 60))); do
+        [[ "$excl" == *" $cand "* ]] && continue
+        if port_free "$cand"; then echo "$cand"; return 0; fi
+    done
+    return 1
+}
 
 # Docker may require sudo depending on group membership.
 DOCKER="docker"
@@ -108,20 +133,6 @@ curl -sf --max-time 5 "http://127.0.0.1:${VLLM_PORT}/health" >/dev/null \
 curl -sf --max-time 5 "http://127.0.0.1:${MOCR_PORT}/health" >/dev/null \
     || die "dgx-stack OCR model not healthy on :${MOCR_PORT} — deploy the stack first"
 
-# Ports MindRouter's host-networked services will bind
-for p in "$MINDROUTER_PORT" "$MINDROUTER_MCP_PORT" 3306 3307 6379 "$SIDECAR_PORT"; do
-    if curl -sf --max-time 2 -o /dev/null "http://127.0.0.1:${p}/" 2>/dev/null \
-       || (exec 3<>"/dev/tcp/127.0.0.1/${p}") 2>/dev/null; then
-        exec 3>&- 2>/dev/null || true
-        # Port in use is fine on re-runs when it's MindRouter itself
-        if [[ -d "$MINDROUTER_DIR/.git" ]]; then
-            warn "port ${p} in use (expected on re-run)"
-        else
-            die "port ${p} is already in use — set MINDROUTER_PORT/MINDROUTER_MCP_PORT or free it"
-        fi
-    fi
-done
-
 # ── Clone / update ─────────────────────────────────────────────────────────
 if [[ -d "$MINDROUTER_DIR/.git" ]]; then
     info "Updating existing checkout at $MINDROUTER_DIR"
@@ -130,6 +141,73 @@ else
     info "Cloning MindRouter to $MINDROUTER_DIR"
     git clone "$MINDROUTER_REPO" "$MINDROUTER_DIR"
 fi
+
+# ── Port selection ─────────────────────────────────────────────────────────
+# MindRouter binds six host ports. Pin the choices in .dgx-ports so re-runs
+# reuse them; auto-select free ports on first install. An explicit env value
+# always wins (and is validated free). Preferred values match MindRouter's
+# conventions where they don't clash with the dgx-stack (8000/8001 do, so the
+# gateway/MCP default to 8080/8081).
+PORT_STATE="$MINDROUTER_DIR/.dgx-ports"
+declare -A PREF=( [MR_GATEWAY]=8080 [MR_MCP]=8081 [MR_MARIADB]=3306
+                  [MR_ARCHIVE]=3307 [MR_REDIS]=6379 [MR_SIDECAR]=8007 )
+
+# Migration: an install from before .dgx-ports existed encoded the gateway/MCP
+# ports in its override and left the infra ports at MindRouter's defaults.
+# Reconstruct the pins so a re-run adopts the running instance instead of
+# moving it onto fresh ports.
+OVERRIDE="$MINDROUTER_DIR/docker-compose.override.yml"
+if [[ ! -f "$PORT_STATE" && -f "$OVERRIDE" ]]; then
+    mapfile -t _oldports < <(grep -oE '"--port", "[0-9]+"' "$OVERRIDE" | grep -oE '[0-9]+')
+    if [[ ${#_oldports[@]} -ge 2 ]]; then
+        info "Migrating a pre-existing install to pinned ports (adopting current ports)"
+        { echo "# migrated from a pre-.dgx-ports install"
+          echo "MR_GATEWAY=${_oldports[0]}"; echo "MR_MCP=${_oldports[1]}"
+          echo "MR_MARIADB=3306"; echo "MR_ARCHIVE=3307"
+          echo "MR_REDIS=6379";   echo "MR_SIDECAR=8007"
+        } > "$PORT_STATE"
+    fi
+fi
+
+# Load pinned ports from a prior install (KEY=VALUE, safe to grep-parse).
+declare -A PORT=()
+if [[ -f "$PORT_STATE" ]]; then
+    while IFS='=' read -r k v; do [[ "$k" == MR_* ]] && PORT[$k]="$v"; done < "$PORT_STATE"
+    info "Reusing pinned ports from $PORT_STATE"
+fi
+# Explicit env overrides take precedence over pinned/auto for the two public ports.
+[[ -n "$MINDROUTER_PORT" ]] && PORT[MR_GATEWAY]="$MINDROUTER_PORT"
+[[ -n "$MINDROUTER_MCP_PORT" ]] && PORT[MR_MCP]="$MINDROUTER_MCP_PORT"
+
+chosen=""
+for key in MR_GATEWAY MR_MCP MR_MARIADB MR_ARCHIVE MR_REDIS MR_SIDECAR; do
+    if [[ -n "${PORT[$key]:-}" ]]; then
+        # Already decided (pinned or explicit). Validate it is usable: free,
+        # or already held by our own running MindRouter (re-run case).
+        if ! port_free "${PORT[$key]}" \
+           && ! $DOCKER ps --filter name=mindrouter --format '{{.Names}}' 2>/dev/null | grep -q .; then
+            die "requested port ${PORT[$key]} for ${key#MR_} is in use by another process — free it or set a different value"
+        fi
+    else
+        PORT[$key]="$(pick_port "${PREF[$key]}" $chosen)" \
+            || die "could not find a free port near ${PREF[$key]} for ${key#MR_}"
+    fi
+    chosen="$chosen ${PORT[$key]}"
+done
+
+# Persist the decisions.
+{ echo "# MindRouter host ports — pinned by install-mindrouter.sh; do not reorder"
+  for key in MR_GATEWAY MR_MCP MR_MARIADB MR_ARCHIVE MR_REDIS MR_SIDECAR; do
+      echo "${key}=${PORT[$key]}"; done
+} > "$PORT_STATE"
+
+MINDROUTER_PORT="${PORT[MR_GATEWAY]}"
+MINDROUTER_MCP_PORT="${PORT[MR_MCP]}"
+MARIADB_PORT="${PORT[MR_MARIADB]}"
+ARCHIVE_PORT="${PORT[MR_ARCHIVE]}"
+REDIS_PORT="${PORT[MR_REDIS]}"
+SIDECAR_PORT="${PORT[MR_SIDECAR]}"
+info "Ports: gateway ${MINDROUTER_PORT}, mcp ${MINDROUTER_MCP_PORT}, mariadb ${MARIADB_PORT}, archive ${ARCHIVE_PORT}, redis ${REDIS_PORT}, sidecar ${SIDECAR_PORT}"
 
 mkdir -p "$MINDROUTER_DATA/artifacts"
 # The app container writes artifacts as uid 1000 (appuser); the bind mount
@@ -182,15 +260,42 @@ else
     fi
 fi
 # Read generated values we need later
-SIDECAR_SECRET_KEY="$(grep '^SIDECAR_SECRET_KEY=' "$MINDROUTER_DIR/.env" | head -1 | cut -d= -f2-)"
-MYSQL_ROOT_PASSWORD="$(grep '^MYSQL_ROOT_PASSWORD=' "$MINDROUTER_DIR/.env" | head -1 | cut -d= -f2-)"
+envval() { grep "^${1}=" "$MINDROUTER_DIR/.env" | head -1 | cut -d= -f2-; }
+SIDECAR_SECRET_KEY="$(envval SIDECAR_SECRET_KEY)"
+MYSQL_ROOT_PASSWORD="$(envval MYSQL_ROOT_PASSWORD)"
+MYSQL_PASSWORD="$(envval MYSQL_PASSWORD)"
+MYSQL_ARCHIVE_PASSWORD="$(envval MYSQL_ARCHIVE_PASSWORD)"
+: "${MYSQL_PASSWORD:=mindrouter_password}"      # compose defaults if .env predates this installer
+: "${MYSQL_ARCHIVE_PASSWORD:=archive_password}"
 
-# ── Compose override: ports + local storage paths ──────────────────────────
-info "Writing docker-compose.override.yml (app :${MINDROUTER_PORT}, mcp :${MINDROUTER_MCP_PORT})"
+# ── Compose override: ports + connection URLs + local storage ──────────────
+# Every MindRouter service uses host networking, so each host port moved here
+# must be moved in BOTH places: the service's own listen port, and the URL
+# the app/mcp containers use to reach it (they dial 127.0.0.1:<port>).
+# compose merges `environment` by key with the override winning.
+DB_URL="mysql+pymysql://mindrouter:${MYSQL_PASSWORD}@127.0.0.1:${MARIADB_PORT}/mindrouter"
+ARCHIVE_URL="mysql+pymysql://mindrouter_archive:${MYSQL_ARCHIVE_PASSWORD}@127.0.0.1:${ARCHIVE_PORT}/mindrouter_archive"
+REDIS_URL="redis://127.0.0.1:${REDIS_PORT}/0"
+
+# The archive DB's my.cnf (mariadb/archive.cnf, mounted at conf.d/custom.cnf)
+# hardcodes `port = 3307`, which overrides MYSQL_TCP_PORT. Generate a
+# replacement cnf carrying the chosen port so the archive binds where we
+# told it. (The main DB's custom.cnf sets no port, so MYSQL_TCP_PORT alone
+# moves it.)
+cat > "$MINDROUTER_DIR/.mr-archive.cnf" <<EOF
+# Generated by dgx-stack install-mindrouter.sh — overrides mariadb/archive.cnf
+[mysqld]
+port = ${ARCHIVE_PORT}
+character_set_server = utf8mb4
+collation_server = utf8mb4_unicode_ci
+max_allowed_packet = 64M
+EOF
+info "Writing docker-compose.override.yml (gateway :${MINDROUTER_PORT}, and remapped infra ports)"
 cat > "$MINDROUTER_DIR/docker-compose.override.yml" <<EOF
 # Generated by dgx-stack install-mindrouter.sh — do not edit by hand.
-# Moves MindRouter off ports 8000/8001 (used by the dgx-stack vLLM
-# instances) and replaces site-specific /archivedb bind mounts.
+# Moves every host-bound MindRouter port to an auto-selected free port
+# (pinned in .dgx-ports) and rewrites the app/mcp connection URLs to match,
+# and replaces site-specific /archivedb bind mounts with a named volume.
 services:
   app:
     command: ["uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "${MINDROUTER_PORT}", "--workers", "2", "--timeout-graceful-shutdown", "60"]
@@ -200,6 +305,11 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+    environment:
+      - DATABASE_URL=${DB_URL}
+      - ARCHIVE_DATABASE_URL=${ARCHIVE_URL}
+      - REDIS_URL=${REDIS_URL}
+      - MCP_SERVER_URL=http://127.0.0.1:${MINDROUTER_MCP_PORT}
     volumes:
       - ${MINDROUTER_DATA}/artifacts:/data/artifacts
   mcp:
@@ -210,9 +320,34 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    environment:
+      - DATABASE_URL=${DB_URL}
+      - REDIS_URL=${REDIS_URL}
+  mariadb:
+    environment:
+      - MYSQL_TCP_PORT=${MARIADB_PORT}
   mariadb-archive:
+    environment:
+      - MYSQL_TCP_PORT=${ARCHIVE_PORT}
     volumes:
       - mariadb_archive_data:/var/lib/mysql
+      # Replace the port-pinning archive.cnf (mounted at the same target in
+      # the base compose) with our port-aware copy.
+      - ${MINDROUTER_DIR}/.mr-archive.cnf:/etc/mysql/conf.d/custom.cnf:ro
+  redis:
+    # redis-cli in the healthcheck defaults to 6379, so it must be told the
+    # moved port explicitly or the container reports unhealthy forever.
+    command: redis-server --appendonly yes --port ${REDIS_PORT}
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "${REDIS_PORT}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  gpu-sidecar:
+    # Only the port changes; compose merges environment by key, so the base
+    # service's SIDECAR_SECRET_KEY and GPU_AGENT_HOST are preserved.
+    environment:
+      - GPU_AGENT_PORT=${SIDECAR_PORT}
 EOF
 
 # ── Build ──────────────────────────────────────────────────────────────────
@@ -235,18 +370,46 @@ info "Running database migrations"
 if [[ -f "$MINDROUTER_DIR/.admin_api_key" ]]; then
     info "Reusing saved admin API key"
 else
-    info "Seeding admin user and capturing the admin API key"
-    seed_out="$(cd "$MINDROUTER_DIR" && $DOCKER compose run --rm --no-deps app python scripts/seed_dev_data.py 2>&1 || true)"
-    # The seed output prints the key PREFIX on one line and the full key on
-    # the "FULL KEY (save this!)" line — anchor on the latter.
-    admin_key="$(printf '%s\n' "$seed_out" | grep 'FULL KEY' | grep -o 'mr2_[A-Za-z0-9_-]*' | head -1 || true)"
+    info "Seeding admin user (groups, admin account, quota)"
+    # The seed creates the groups + admin user. Its one-time key print is
+    # unreliable — a benign aiomysql "Event loop is closed" teardown warning
+    # can eat the line while the key is still committed — so we IGNORE the
+    # seed's output entirely and mint our own key deterministically below.
+    # This also removes the old unrecoverable-key trap: if a prior partial
+    # install left an admin user, we simply mint a fresh key for it.
+    (cd "$MINDROUTER_DIR" && $DOCKER compose run --rm --no-deps -T app python scripts/seed_dev_data.py >/dev/null 2>&1) \
+        || warn "seed returned nonzero (usually just the asyncio teardown warning) — continuing"
+
+    info "Minting an admin API key via MindRouter's own key helpers"
+    mint_out="$(cd "$MINDROUTER_DIR" && $DOCKER compose run --rm --no-deps -T app python - 2>/dev/null <<'PY'
+import asyncio
+from backend.app.db.session import get_async_db_context
+from backend.app.db import crud
+from backend.app.security import generate_api_key
+
+async def main():
+    async with get_async_db_context() as db:
+        user = await crud.get_user_by_username(db, "admin")
+        if user is None:
+            print("DGX_KEY_ERROR=no-admin-user"); return
+        full_key, key_hash, key_prefix = generate_api_key()
+        await crud.create_api_key(db=db, user_id=user.id, key_hash=key_hash,
+                                  key_prefix=key_prefix, name="dgx-stack installer")
+        await db.commit()
+        print("DGX_ADMIN_KEY=" + full_key)
+
+asyncio.run(main())
+PY
+)" || true
+    # Anchor on our sentinel so any interleaved teardown noise is ignored.
+    admin_key="$(printf '%s\n' "$mint_out" | sed -n 's/^DGX_ADMIN_KEY=//p' | head -1)"
     if [[ -z "$admin_key" ]]; then
-        printf '%s\n' "$seed_out" | tail -5
-        die "Could not capture the admin API key. If the admin user already exists from a previous partial install, the key cannot be re-printed — remove the MindRouter volumes and re-run, or mint a key manually."
+        printf '%s\n' "$mint_out" | tail -5
+        die "Could not mint an admin API key — check: $DOCKER compose -f $MINDROUTER_DIR/docker-compose.yml run --rm app python scripts/seed_dev_data.py"
     fi
     printf '%s' "$admin_key" > "$MINDROUTER_DIR/.admin_api_key"
     chmod 600 "$MINDROUTER_DIR/.admin_api_key"
-    info "Admin API key saved to $MINDROUTER_DIR/.admin_api_key (chmod 600)"
+    info "Admin API key minted and saved to $MINDROUTER_DIR/.admin_api_key (chmod 600)"
 fi
 
 # ── Start the full stack ───────────────────────────────────────────────────

@@ -591,7 +591,7 @@ action_install_mindrouter() {
     echo "scheduling, dashboards, and audit logging. This will:"
     echo ""
     echo "  • Clone and build MindRouter locally (first build takes a while)"
-    echo "  • Run it on port 8080 (gateway) alongside this stack"
+    echo "  • Run its gateway alongside this stack (default port 8080)"
     echo "  • Register this DGX as a node (with GPU telemetry sidecar)"
     echo "  • Register both vLLM instances as backends"
     echo "  • Smoke-test a routed chat and OCR request"
@@ -606,6 +606,19 @@ action_install_mindrouter() {
             return
         fi
     fi
+
+    # Offer a gateway port. The installer auto-selects a free port if left
+    # blank; showing a concrete free default helps users who want to pick
+    # deliberately (e.g. because Vandalizer already holds 8080).
+    local mr_port_hint=8080
+    if command -v ss >/dev/null 2>&1 && ss -Htln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]8080$"; then
+        mr_port_hint=8090
+        warn "Port 8080 is already in use — the installer will pick a free port (e.g. ${mr_port_hint})."
+    fi
+    local mr_port
+    echo -ne "${BOLD}MindRouter gateway port${RESET} ${DIM}[blank = auto-select, e.g. ${mr_port_hint}]${RESET}: "
+    read -r mr_port
+    [[ -n "$mr_port" ]] && export MINDROUTER_PORT="$mr_port"
 
     if bash "${SCRIPT_DIR}/mindrouter/install-mindrouter.sh"; then
         info "MindRouter installation finished."

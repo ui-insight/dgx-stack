@@ -32,10 +32,14 @@ for the container user). It:
 
 1. Clones MindRouter to `~/mindrouter` (or updates an existing checkout)
 2. Generates all secrets into `~/mindrouter/.env` (preserved across re-runs)
-3. Writes a `docker-compose.override.yml` that moves MindRouter off the
-   colliding defaults — gateway on **8080**, its MCP service on **8081**
-   (8000/8001 belong to the vLLM instances) — and replaces its
-   site-specific `/archivedb` bind mounts with local paths
+3. **Auto-selects free ports** for every host-bound MindRouter service
+   (gateway, MCP, MariaDB ×2, Redis, GPU sidecar) and writes a
+   `docker-compose.override.yml` that moves them there — rewriting the app's
+   database/Redis/MCP connection URLs to match — and replaces its
+   site-specific `/archivedb` bind mounts with local paths. The gateway
+   prefers **8080** but steps to the next free port if something else (e.g.
+   a Vandalizer install) already holds it. Chosen ports are pinned in
+   `~/mindrouter/.dgx-ports` so re-runs stay stable
 4. Builds the images from source (**the first build takes a while** on the
    Grace CPU — the app image includes LibreOffice and PyTorch; subsequent
    runs use the build cache)
@@ -60,21 +64,24 @@ Set via environment before running (defaults shown):
 |----------|---------|---------|
 | `MINDROUTER_DIR` | `~/mindrouter` | Install location (git clone) |
 | `MINDROUTER_REPO` | `https://github.com/ui-insight/mindrouter.git` | Source repo |
-| `MINDROUTER_PORT` | 8080 | Gateway port |
-| `MINDROUTER_MCP_PORT` | 8081 | MCP service port |
+| `MINDROUTER_PORT` | auto (prefers 8080) | Gateway port — set to force a specific one |
+| `MINDROUTER_MCP_PORT` | auto (prefers 8081) | MCP service port |
 | `MINDROUTER_DATA` | `~/mindrouter-data` | Artifact storage (owned by uid 1000) |
 | `MINDROUTER_NODE_NAME` | `hostname -s` | Node name to register |
 
-Host ports used (all on the host network, per MindRouter's compose):
-**8080** gateway, **8081** MCP, **8007** GPU sidecar, **3306**/**3307**
-MariaDB main/archive, **6379** Redis. The installer preflights that these
-are free.
+**Ports are auto-selected.** MindRouter binds six host ports (gateway, MCP,
+MariaDB main/archive, Redis, GPU sidecar). The installer picks a free port
+for each — preferring 8080/8081/3306/3307/6379/8007 but stepping past
+anything already in use — and pins the choices in `~/mindrouter/.dgx-ports`
+so re-runs are stable. Setting `MINDROUTER_PORT` (or `MINDROUTER_MCP_PORT`)
+forces a specific port and fails fast if it's occupied by something else.
+`cat ~/mindrouter/.dgx-ports` shows what was chosen.
 
-**Security note:** because MindRouter's compose uses host networking,
-the databases (3306/3307), Redis (6379), and the GPU sidecar (8007)
-listen on all host interfaces — not just localhost. On a network-exposed
-DGX, firewall those ports (e.g. `ufw`) so only the gateway (8080) and,
-if desired, the direct vLLM/OCR ports are reachable from clients.
+**Security note:** because MindRouter's compose uses host networking, the
+databases, Redis, and the GPU sidecar listen on all host interfaces — not
+just localhost. On a network-exposed DGX, firewall those ports (e.g. `ufw`)
+so only the gateway and, if desired, the direct vLLM/OCR ports are reachable
+from clients. (`~/mindrouter/.dgx-ports` lists the exact port numbers.)
 
 The backend registrations mirror the dgx-stack `.env`: `dgx-qwen` gets
 `max_concurrent` = `MAX_NUM_SEQS` (12), `dgx-mocr` is capped at 4 —
