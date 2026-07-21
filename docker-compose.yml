@@ -18,6 +18,12 @@ services:
       - HF_TOKEN=${HF_TOKEN}
       - HF_MODEL_ID=${HF_MODEL_ID:-nvidia/Qwen3.6-35B-A3B-NVFP4}
       - SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-qwen3.6-35b}
+      # HF_OFFLINE=1 forbids all Hugging Face network calls, so vLLM loads
+      # purely from the local cache — required for reliable air-gapped boot.
+      # Must stay 0 for the FIRST deploy (the weights download then); set to
+      # 1 afterward. See the "Offline / air-gapped operation" README section.
+      - HF_HUB_OFFLINE=${HF_OFFLINE:-0}
+      - TRANSFORMERS_OFFLINE=${HF_OFFLINE:-0}
       - VLLM_PORT=${VLLM_PORT:-8000}
       - KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-auto}
       - MAX_MODEL_LEN=${MAX_MODEL_LEN:-262144}
@@ -65,6 +71,12 @@ services:
       - HF_TOKEN=${HF_TOKEN}
       - HF_MODEL_ID=${MOCR_MODEL_ID:-binedge/dots.mocr-FP8}
       - SERVED_MODEL_NAME=${MOCR_SERVED_MODEL_NAME:-dots-mocr}
+      # See the vllm service: 1 = load only from local cache (air-gapped).
+      # dots.mocr ships trust-remote-code (configuration_dots.py); the file
+      # is cached in the model snapshot, so offline mode executes the cached
+      # copy instead of fetching it.
+      - HF_HUB_OFFLINE=${HF_OFFLINE:-0}
+      - TRANSFORMERS_OFFLINE=${HF_OFFLINE:-0}
       - VLLM_PORT=${MOCR_PORT:-8001}
       - KV_CACHE_DTYPE=${MOCR_KV_CACHE_DTYPE:-auto}
       - MAX_MODEL_LEN=${MOCR_MAX_MODEL_LEN:-32768}

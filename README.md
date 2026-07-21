@@ -328,6 +328,45 @@ allocates from `10.10.0.0/16` in `/24` slices. Nothing lands on `172.x.x.x`.
 - **Warmup** — The first request to each instance after startup takes up to ~60s due to torch.compile/CUDA graph warmup. Subsequent requests are fast.
 - **fastsafetensors** — If the LLM fails at startup with a load-format error (e.g. a custom image without the `fastsafetensors` package), remove `--load-format fastsafetensors` from `VLLM_EXTRA_FLAGS`.
 
+## Offline / air-gapped operation
+
+The stack is designed to run with **no internet at all** once the models are
+cached. Everything needed is local: the Docker images are built on the box,
+the model weights and (for dots.mocr) its `trust_remote_code` files live in a
+**persistent** HuggingFace cache mount, and every container uses
+`restart: unless-stopped` with Docker enabled at boot — so a reboot brings the
+whole stack back automatically without contacting the internet.
+
+Two things make it robust rather than merely likely to work:
+
+1. **Set `HF_OFFLINE=1`** in `.env` after your first successful deploy. This
+   sets `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` on both vLLM
+   instances, so they load **purely from the local cache** and never attempt
+   a HuggingFace network call (which offline would otherwise turn into slow
+   timeouts or, for the remote-code path, a hard failure). Then redeploy:
+
+   ```bash
+   # in .env: HF_OFFLINE=1
+   docker compose up -d vllm mocr
+   ```
+
+   **Leave `HF_OFFLINE=0` for the very first deploy** — that's when the ~28GB
+   of weights download. Turning it on before the models are cached would stop
+   them from ever downloading. Verified on DGX Spark: with `HF_OFFLINE=1` both
+   instances load and serve from cache with the network fully forbidden.
+
+2. **The models must already be cached.** They live in `HF_CACHE`
+   (default `~/.cache/huggingface`, a bind mount that survives container
+   recreation). Back up that directory if you're building a golden image or
+   moving to a truly disconnected site.
+
+Note on Vandalizer (if installed): its RAG embedding model (ONNX MiniLM) is
+downloaded once into the container's filesystem. It survives reboots (the same
+container restarts), but a `docker compose down && up` **recreate** while
+offline would lose it and fail to re-download — so avoid recreating the
+Vandalizer containers on a disconnected box, or persist
+`/home/appuser/.cache/chroma` to a volume first.
+
 ## Optional: MindRouter Gateway
 
 [MindRouter](https://github.com/ui-insight/mindrouter) is an LLM gateway /
