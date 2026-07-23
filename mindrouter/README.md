@@ -32,7 +32,15 @@ for the container user). It:
 
 1. Clones MindRouter to `~/mindrouter` (or updates an existing checkout)
 2. Generates all secrets into `~/mindrouter/.env` (preserved across re-runs)
-3. **Auto-selects free ports** for every host-bound MindRouter service
+3. **Vendors the dashboard's CDN assets locally** (`vendor-assets.sh`) — the
+   dashboard's JS/CSS/fonts otherwise load from `cdn.jsdelivr.net` in the
+   browser, which breaks on an offline/hotspot client. It downloads them once
+   (needs internet, like the model download) into the dashboard's own
+   `/static/vendor/` and repoints the templates. Idempotent and best-effort
+   (a failure just leaves the dashboard using the CDN when online). Re-run by
+   hand as `./mindrouter/vendor-assets.sh` if a MindRouter update reverts the
+   templates
+4. **Auto-selects free ports** for every host-bound MindRouter service
    (gateway, MCP, MariaDB ×2, Redis, GPU sidecar) and writes a
    `docker-compose.override.yml` that moves them there — rewriting the app's
    database/Redis/MCP connection URLs to match — and replaces its

@@ -142,6 +142,14 @@ else
     git clone "$MINDROUTER_REPO" "$MINDROUTER_DIR"
 fi
 
+# Vendor the dashboard's CDN assets locally so the UI works air-gapped. This
+# needs internet (like the model download) and runs once; it's best-effort —
+# a failure just leaves the dashboard using the CDN when online, so it must
+# not abort the install.
+info "Vendoring MindRouter dashboard assets for offline use"
+bash "$SCRIPT_DIR/vendor-assets.sh" "$MINDROUTER_DIR" \
+    || warn "asset vendoring skipped/failed — dashboard will use the CDN when online"
+
 # ── Port selection ─────────────────────────────────────────────────────────
 # MindRouter binds six host ports. Pin the choices in .dgx-ports so re-runs
 # reuse them; auto-select free ports on first install. An explicit env value
